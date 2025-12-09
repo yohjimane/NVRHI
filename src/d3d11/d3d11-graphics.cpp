@@ -35,7 +35,7 @@ namespace nvrhi::d3d11
         Framebuffer *ret = new Framebuffer();
         ret->desc = desc;
         ret->framebufferInfo = FramebufferInfoEx(desc);
-        
+
         for(auto colorAttachment : desc.colorAttachments)
         {
             assert(colorAttachment.valid());
@@ -71,7 +71,7 @@ namespace nvrhi::d3d11
         pso->pBlendState = getBlendState(renderState.blendState);
         pso->pDepthStencilState = getDepthStencilState(renderState.depthStencilState);
         pso->requiresBlendFactor = renderState.blendState.usesConstantColor(uint32_t(pso->framebufferInfo.colorFormats.size()));
-        
+
         pso->shaderMask = ShaderType::None;
 
         if (desc.VS) { pso->pVS = checked_cast<Shader*>(desc.VS.Get())->VS; pso->shaderMask = pso->shaderMask | ShaderType::Vertex; }
@@ -84,7 +84,7 @@ namespace nvrhi::d3d11
         for (auto& _layout : desc.bindingLayouts)
         {
             BindingLayout* layout = checked_cast<BindingLayout*>(_layout.Get());
-            
+
             if ((layout->desc.visibility & ShaderType::Pixel) == 0)
                 continue;
 
@@ -100,7 +100,7 @@ namespace nvrhi::d3d11
             if (pso->pixelShaderHasUAVs)
                 break;
         }
-        
+
         return GraphicsPipelineHandle::Create(pso);
     }
 
@@ -108,7 +108,7 @@ namespace nvrhi::d3d11
     {
         if (!fb)
             return nullptr;
-            
+
         return createGraphicsPipeline(desc, fb->getFramebufferInfo());
     }
 
@@ -161,7 +161,7 @@ namespace nvrhi::d3d11
         if (m_CurrentComputeStateValid)
         {
             // If the previous operation has been a Dispatch call, there is a possibility of RT/UAV/SRV hazards.
-            // Unbind everything to be sure, and to avoid checking the binding sets against each other. 
+            // Unbind everything to be sure, and to avoid checking the binding sets against each other.
             // This only happens on switches between compute and graphics modes.
 
             clearState();
@@ -175,11 +175,11 @@ namespace nvrhi::d3d11
             arraysAreDifferent(m_CurrentViewports.viewports, state.viewport.viewports) ||
             arraysAreDifferent(m_CurrentViewports.scissorRects, state.viewport.scissorRects);
 
-        const bool updateBlendState = !m_CurrentGraphicsStateValid || 
+        const bool updateBlendState = !m_CurrentGraphicsStateValid ||
             (pipeline->requiresBlendFactor && state.blendConstantColor != m_CurrentBlendConstantColor);
         const bool updateStencilRef = !m_CurrentGraphicsStateValid ||
             (pipeline->desc.renderState.depthStencilState.dynamicStencilRef && state.dynamicStencilRefValue != m_CurrentStencilRefValue);
-            
+
         const bool updateIndexBuffer = !m_CurrentGraphicsStateValid || m_CurrentIndexBufferBinding != state.indexBuffer;
         const bool updateVertexBuffers = !m_CurrentGraphicsStateValid || arraysAreDifferent(m_CurrentVertexBufferBindings, state.vertexBuffers);
 
@@ -308,7 +308,7 @@ namespace nvrhi::d3d11
                 // This is tested by the validation layer, skip invalid slots here if VL is not used.
                 if (binding.slot >= c_MaxVertexAttributes)
                     continue;
-                
+
                 assert(binding.offset <= UINT_MAX);
 
                 pVertexBuffers[binding.slot] = checked_cast<Buffer*>(binding.buffer)->resource;
@@ -387,7 +387,7 @@ namespace nvrhi::d3d11
     void CommandList::drawIndirect(uint32_t offsetBytes, uint32_t drawCount)
     {
         Buffer* indirectParams = checked_cast<Buffer*>(m_CurrentIndirectBuffer.Get());
-        
+
         if (indirectParams) // validation layer will issue an error otherwise
         {
             // Simulate multi-command D3D12 ExecuteIndirect or Vulkan vkCmdDrawIndirect with a loop
@@ -412,6 +412,15 @@ namespace nvrhi::d3d11
                 offsetBytes += sizeof(DrawIndexedIndirectArguments);
             }
         }
+    }
+
+    void CommandList::drawIndexedIndirectCount(uint32_t offsetBytes, IBuffer* countBuffer, uint32_t countBufferOffset, uint32_t maxDrawCount)
+    {
+        // D3D11 doesn't support count buffers for indirect draws
+        // Fall back to using maxDrawCount which will issue empty draws with index count = 0
+        (void)countBuffer;
+        (void)countBufferOffset;
+        drawIndexedIndirect(offsetBytes, maxDrawCount);
     }
 
     ID3D11BlendState* Device::getBlendState(const BlendState& blendState)
@@ -486,7 +495,7 @@ namespace nvrhi::d3d11
         hash_combine(hash, depthState.backFaceStencil.depthFailOp);
         hash_combine(hash, depthState.backFaceStencil.passOp);
         hash_combine(hash, depthState.backFaceStencil.stencilFunc);
-        
+
         RefCountPtr<ID3D11DepthStencilState> d3dDepthStencilState = m_DepthStencilStates[hash];
 
         if (d3dDepthStencilState)

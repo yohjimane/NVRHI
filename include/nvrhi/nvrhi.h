@@ -3286,7 +3286,18 @@ namespace nvrhi
         // - DX12: Maps to ExecuteIndirect with a predefined signature.
         // - Vulkan: Maps to vkCmdDrawIndexedIndirect.
         virtual void drawIndexedIndirect(uint32_t offsetBytes, uint32_t drawCount = 1) = 0;
-        
+
+        // Draws primitives with indexed vertices using the parameters provided in the indirect arguments buffer
+        // specified in the prior call to setGraphicsState(...). The draw count is read from a GPU buffer.
+        // This enables true GPU-driven rendering where the GPU determines how many draws to execute.
+        // - countBuffer: Buffer containing the draw count (single uint32_t)
+        // - countBufferOffset: Byte offset into the count buffer
+        // - maxDrawCount: Maximum number of draws (safety limit)
+        // - DX11: Not supported (falls back to maxDrawCount draws).
+        // - DX12: Maps to ExecuteIndirect with pCountBuffer parameter.
+        // - Vulkan: Maps to vkCmdDrawIndexedIndirectCount.
+        virtual void drawIndexedIndirectCount(uint32_t offsetBytes, IBuffer* countBuffer, uint32_t countBufferOffset, uint32_t maxDrawCount) = 0;
+
         // Sets the specified compute state on the command list.
         // The state includes the pipeline (or individual shaders on DX11) and all resources bound to it.
         // See the members of ComputeState for more information.

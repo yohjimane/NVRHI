@@ -40,7 +40,7 @@ namespace nvrhi::d3d12
             return nullptr;
         }
     }
-    
+
     RefCountPtr<ID3D12PipelineState> Device::createPipelineState(const GraphicsPipelineDesc & state, RootSignature* pRS, const FramebufferInfo& fbinfo) const
     {
         if (state.renderState.singlePassStereo.enabled && !m_SinglePassStereoSupported)
@@ -70,7 +70,7 @@ namespace nvrhi::d3d12
 
 
         TranslateBlendState(state.renderState.blendState, desc.BlendState);
-        
+
 
         const DepthStencilState& depthState = state.renderState.depthStencilState;
         TranslateDepthStencilState(depthState, desc.DepthStencilState);
@@ -188,12 +188,12 @@ namespace nvrhi::d3d12
 
         return createHandleForNativeGraphicsPipeline(pRS, pPSO, desc, fbinfo);
     }
-    
+
     GraphicsPipelineHandle Device::createGraphicsPipeline(const GraphicsPipelineDesc& desc, IFramebuffer* fb)
     {
         if (!fb)
             return nullptr;
-            
+
         return createGraphicsPipeline(desc, fb->getFramebufferInfo());
     }
 
@@ -211,7 +211,7 @@ namespace nvrhi::d3d12
         pso->rootSignature = checked_cast<RootSignature*>(rootSignature);
         pso->pipelineState = pipelineState;
         pso->requiresBlendFactor = desc.renderState.blendState.usesConstantColor(uint32_t(pso->framebufferInfo.colorFormats.size()));
-        
+
         return GraphicsPipelineHandle::Create(pso);
     }
 
@@ -276,14 +276,14 @@ namespace nvrhi::d3d12
         if (DSV != c_InvalidDescriptorIndex)
             m_Resources.depthStencilViewHeap.releaseDescriptor(DSV);
     }
-    
+
     void CommandList::bindFramebuffer(Framebuffer *fb)
     {
         if (m_EnableAutomaticBarriers)
         {
             setResourceStatesForFramebuffer(fb);
         }
-        
+
         static_vector<D3D12_CPU_DESCRIPTOR_HANDLE, 16> RTVs;
         for (uint32_t rtIndex = 0; rtIndex < fb->RTVs.size(); rtIndex++)
         {
@@ -314,12 +314,12 @@ namespace nvrhi::d3d12
             arraysAreDifferent(m_CurrentGraphicsState.viewport.scissorRects, state.viewport.scissorRects);
 
         const bool updateBlendFactor = !m_CurrentGraphicsStateValid || m_CurrentGraphicsState.blendConstantColor != state.blendConstantColor;
-        
+
         const uint8_t effectiveStencilRefValue = pso->desc.renderState.depthStencilState.dynamicStencilRef
             ? state.dynamicStencilRefValue
             : pso->desc.renderState.depthStencilState.stencilRefValue;
         const bool updateStencilRef = !m_CurrentGraphicsStateValid || m_CurrentGraphicsState.dynamicStencilRefValue != effectiveStencilRefValue;
-        
+
         const bool updateIndexBuffer = !m_CurrentGraphicsStateValid || m_CurrentGraphicsState.indexBuffer != state.indexBuffer;
         const bool updateVertexBuffers = !m_CurrentGraphicsStateValid || arraysAreDifferent(m_CurrentGraphicsState.vertexBuffers, state.vertexBuffers);
 
@@ -456,7 +456,7 @@ namespace nvrhi::d3d12
                 m_ActiveCommandList->commandList6->RSSetShadingRate(D3D12_SHADING_RATE_1X1, nullptr);
             }
         }
-        
+
         commitBarriers();
 
         if (updateViewports)
@@ -580,7 +580,26 @@ namespace nvrhi::d3d12
 
         m_ActiveCommandList->commandList->ExecuteIndirect(m_Context.drawIndexedIndirectSignature, drawCount, indirectParams->resource, offsetBytes, nullptr, 0);
     }
-    
+
+    void CommandList::drawIndexedIndirectCount(uint32_t offsetBytes, IBuffer* countBuffer, uint32_t countBufferOffset, uint32_t maxDrawCount)
+    {
+        Buffer* indirectParams = checked_cast<Buffer*>(m_CurrentGraphicsState.indirectParams);
+        Buffer* countBuf = checked_cast<Buffer*>(countBuffer);
+        assert(indirectParams);
+        assert(countBuf);
+
+        updateGraphicsVolatileBuffers();
+
+        m_ActiveCommandList->commandList->ExecuteIndirect(
+            m_Context.drawIndexedIndirectSignature,
+            maxDrawCount,
+            indirectParams->resource,
+            offsetBytes,
+            countBuf->resource,
+            countBufferOffset
+        );
+    }
+
     DX12_ViewportState convertViewportState(const RasterState& rasterState, const FramebufferInfoEx& framebufferInfo, const ViewportState& vpState)
     {
         DX12_ViewportState ret;
@@ -625,7 +644,7 @@ namespace nvrhi::d3d12
 
         return ret;
     }
-    
+
     void TranslateBlendState(const BlendState& inState, D3D12_BLEND_DESC& outState)
     {
         outState.AlphaToCoverageEnable = inState.alphaToCoverageEnable;
