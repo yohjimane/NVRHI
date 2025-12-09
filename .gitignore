@@ -1,3 +1,4 @@
 build*/
 .vscode/
 nvapi/
+vs_build/
