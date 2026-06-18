@@ -292,6 +292,7 @@ namespace nvrhi::vulkan
         uint64_t m_LastFinishedID = 0;
 
         // tracks the list of command buffers in flight on this queue
+        std::mutex m_PoolMutex;
         std::list<TrackedCommandBufferPtr> m_CommandBuffersPool;
         CommandListLifetimeTracker m_LifetimeTracker;
 
