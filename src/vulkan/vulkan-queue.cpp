@@ -82,7 +82,11 @@ namespace nvrhi::vulkan
 
     TrackedCommandBufferPtr Queue::getOrCreateCommandBuffer()
     {
-        std::lock_guard lockGuard(m_Mutex); // this is called from CommandList::open, so free-threaded
+        // Called from CommandList::open, so free-threaded. Uses a dedicated pool
+        // mutex so open() never serializes behind submit(), which can hold
+        // m_Mutex for milliseconds when vkQueueSubmit encodes synchronously
+        // (MoltenVK synchronous submits).
+        std::lock_guard lockGuard(m_PoolMutex);
 
         uint64_t recordingID = ++m_LastRecordingID;
 
@@ -324,7 +328,7 @@ namespace nvrhi::vulkan
 
     void Queue::returnCommandBuffersToPool(std::list<TrackedCommandBufferPtr> const& commandBuffers)
     {
-        std::lock_guard lockGuard(m_Mutex);
+        std::lock_guard lockGuard(m_PoolMutex);
 
         m_CommandBuffersPool.insert(m_CommandBuffersPool.end(), commandBuffers.begin(), commandBuffers.end());
     }
