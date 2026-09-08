@@ -337,10 +337,12 @@ namespace nvrhi
     {
         for (auto& [buffer, tracking] : m_BufferStates)
         {
+            if (tracking.generation != m_Generation)
+                continue;
             if (buffer->descRef.keepInitialState && 
                 !buffer->permanentState &&
                 !buffer->descRef.isVolatile &&
-                !tracking->permanentTransition)
+                !tracking.permanentTransition)
             {
                 requireBufferState(buffer, buffer->descRef.initialState);
             }
@@ -351,9 +353,11 @@ namespace nvrhi
     {
         for (auto& [texture, tracking] : m_TextureStates)
         {
+            if (tracking.generation != m_Generation)
+                continue;
             if (texture->descRef.keepInitialState && 
                 !texture->permanentState && 
-                !tracking->permanentTransition)
+                !tracking.permanentTransition)
             {
                 requireTextureState(texture, AllSubresources, texture->descRef.initialState);
             }
@@ -392,64 +396,95 @@ namespace nvrhi
         }
         m_PermanentBufferStates.clear();
 
+        size_t liveTextures = 0;
         for (const auto& [texture, stateTracking] : m_TextureStates)
         {
+            if (stateTracking.generation != m_Generation)
+                continue;
+            ++liveTextures;
             if (texture->descRef.keepInitialState && !texture->stateInitialized)
                 texture->stateInitialized = true;
         }
 
-        m_TextureStates.clear();
-        m_BufferStates.clear();
+        size_t liveBuffers = 0;
+        for (const auto& [buffer, stateTracking] : m_BufferStates)
+        {
+            if (stateTracking.generation == m_Generation)
+                ++liveBuffers;
+        }
+
+        if (m_TextureStates.size() > 2 * liveTextures + 1024)
+        {
+            for (auto it = m_TextureStates.begin(); it != m_TextureStates.end();)
+                it = (it->second.generation == m_Generation) ? std::next(it) : m_TextureStates.erase(it);
+        }
+        if (m_BufferStates.size() > 2 * liveBuffers + 1024)
+        {
+            for (auto it = m_BufferStates.begin(); it != m_BufferStates.end();)
+                it = (it->second.generation == m_Generation) ? std::next(it) : m_BufferStates.erase(it);
+        }
+
+        if (++m_Generation == 0)
+        {
+            m_TextureStates.clear();
+            m_BufferStates.clear();
+            m_Generation = 1;
+        }
     }
 
     TextureState* CommandListResourceStateTracker::getTextureStateTracking(TextureStateExtension* texture, bool allowCreate)
     {
         auto it = m_TextureStates.find(texture);
 
-        if (it != m_TextureStates.end())
+        if (it != m_TextureStates.end() && it->second.generation == m_Generation)
         {
-            return it->second.get();
+            return &it->second;
         }
 
         if (!allowCreate)
             return nullptr;
-        
-        std::unique_ptr<TextureState> trackingRef = std::make_unique<TextureState>();
 
-        TextureState* tracking = trackingRef.get();
-        m_TextureStates.insert(std::make_pair(texture, std::move(trackingRef)));
-        
+        TextureState& tracking = (it != m_TextureStates.end()) ? it->second : m_TextureStates[texture];
+        tracking.subresourceStates.clear();
+        tracking.state = ResourceStates::Unknown;
+        tracking.enableUavBarriers = true;
+        tracking.firstUavBarrierPlaced = false;
+        tracking.permanentTransition = false;
+        tracking.generation = m_Generation;
+
         if (texture->descRef.keepInitialState)
         {
-            tracking->state = texture->stateInitialized ? texture->descRef.initialState : ResourceStates::Common;
+            tracking.state = texture->stateInitialized ? texture->descRef.initialState : ResourceStates::Common;
         }
 
-        return tracking;
+        return &tracking;
     }
 
     BufferState* CommandListResourceStateTracker::getBufferStateTracking(BufferStateExtension* buffer, bool allowCreate)
     {
         auto it = m_BufferStates.find(buffer);
 
-        if (it != m_BufferStates.end())
+        if (it != m_BufferStates.end() && it->second.generation == m_Generation)
         {
-            return it->second.get();
+            return &it->second;
         }
 
         if (!allowCreate)
             return nullptr;
 
-        std::unique_ptr<BufferState> trackingRef = std::make_unique<BufferState>();
+        BufferState& tracking = (it != m_BufferStates.end()) ? it->second : m_BufferStates[buffer];
+        tracking.state = ResourceStates::Unknown;
+        tracking.enableUavBarriers = true;
+        tracking.firstUavBarrierPlaced = false;
+        tracking.permanentTransition = false;
+        tracking.generation = m_Generation;
 
-        BufferState* tracking = trackingRef.get();
-        m_BufferStates.insert(std::make_pair(buffer, std::move(trackingRef)));
-                                                   
         if (buffer->descRef.keepInitialState)
         {
-            tracking->state = buffer->descRef.initialState;
+            tracking.state = buffer->descRef.initialState;
         }
 
-        return tracking;
+        return &tracking;
     }
 
     ResourceStates getShaderResourceStateForBindingLayout(IBindingLayout* bindingLayout)

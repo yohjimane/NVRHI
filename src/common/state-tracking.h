@@ -57,6 +57,7 @@ namespace nvrhi
         bool enableUavBarriers = true;
         bool firstUavBarrierPlaced = false;
         bool permanentTransition = false;
+        uint32_t generation = 0;
     };
 
     struct BufferState
@@ -65,6 +66,7 @@ namespace nvrhi
         bool enableUavBarriers = true;
         bool firstUavBarrierPlaced = false;
         bool permanentTransition = false;
+        uint32_t generation = 0;
     };
 
     struct TextureBarrier
@@ -121,8 +123,9 @@ namespace nvrhi
     private:
         IMessageCallback* m_MessageCallback;
 
-        std::unordered_map<TextureStateExtension*, std::unique_ptr<TextureState>> m_TextureStates;
-        std::unordered_map<BufferStateExtension*, std::unique_ptr<BufferState>> m_BufferStates;
+        std::unordered_map<TextureStateExtension*, TextureState> m_TextureStates;
+        std::unordered_map<BufferStateExtension*, BufferState> m_BufferStates;
+        uint32_t m_Generation = 1;
 
         // Deferred transitions of textures and buffers to permanent states.
         // They are executed only when the command list is executed, not when the app calls setPermanentTextureState or setPermanentBufferState.

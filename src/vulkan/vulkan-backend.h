@@ -1335,6 +1335,8 @@ namespace nvrhi::vulkan
 
         CommandListResourceStateTracker m_StateTracker;
         bool m_EnableAutomaticBarriers = true;
+        std::vector<vk::ImageMemoryBarrier2> m_ImageBarrierScratch;
+        std::vector<vk::BufferMemoryBarrier2> m_BufferBarrierScratch;
 
         // current internal command buffer
         TrackedCommandBufferPtr m_CurrentCmdBuf = nullptr;
