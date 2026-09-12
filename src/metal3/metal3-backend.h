@@ -4,6 +4,7 @@
 
 #include "nvrhi/common/aftermath.h"
 #include "nvrhi/common/resource.h"
+#include "../common/state-tracking.h"
 #include "nvrhi/nvrhi.h"
 #include <nvrhi/metal3.h>
 #include <nvrhi/utils.h>
@@ -56,19 +57,37 @@ namespace nvrhi::metal3
         uint32_t slot = 0;
         uint32_t space = 0;
         MscArgumentType type = MscArgumentType::SRV;
+        uint32_t byteOffset = ~0u;
+        uint64_t sizeBytes = 24;
+        uint32_t tableIndex = ~0u;
+    };
+
+    struct MscDescriptorTable
+    {
+        uint32_t byteOffset = 0;
+        uint32_t descriptorCount = 0;
+        uint32_t slot = 0;
+        uint32_t space = 0;
+        MscArgumentType type = MscArgumentType::SRV;
+        uint32_t layoutIndex = ~0u;
+        uint32_t descriptorOffset = 0;
     };
 
     struct MscShaderReflection
     {
         bool valid = false;
         bool needsFunctionConstants = false;
+        bool directlyIndexedResourceHeap = false;
+        bool directlyIndexedSamplerHeap = false;
         uint32_t resourceCount = 0;
+        uint64_t argumentBufferSize = 0;
         uint32_t vertexOutputSizeInBytes = 0;
         uint32_t maxInputPrimitivesPerMeshThreadgroup = 0;
         uint32_t geometryInstanceCount = 1;
         std::string shaderType;
         std::string inputPrimitive;
         std::vector<MscArgumentBinding> topLevelArgumentBuffer;
+        std::vector<MscDescriptorTable> descriptorTables;
         std::unordered_map<std::string, uint32_t> vertexInputAttributes;
     };
     // shader reflected data, first part basically the MscArgumentBinding i,e per resource
@@ -78,6 +97,8 @@ namespace nvrhi::metal3
         uint32_t slot = 0;
         uint32_t space = 0;
         MscArgumentType argumentType = MscArgumentType::SRV;
+        uint32_t byteOffset = ~0u;
+        uint64_t sizeBytes = 24;
 
         uint32_t layoutIndex = ~0u;
         uint32_t layoutItemIndex = ~0u;
@@ -90,14 +111,18 @@ namespace nvrhi::metal3
         ShaderType stage = ShaderType::None;
         std::string debugName;
         bool valid = false;
+        bool directlyIndexedResourceHeap = false;
+        bool directlyIndexedSamplerHeap = false;
         uint32_t resourceCount = 0;
+        uint64_t argumentBufferSize = 0;
         std::vector<MetalBindingPlanEntry> entries;
+        std::vector<MscDescriptorTable> descriptorTables;
     };
 
     struct MetalArgumentTableCacheKey
     {
         const MetalStageBindingPlan* plan = nullptr;
-        std::vector<const BindingSet*> bindingSets;
+        std::vector<const IBindingSet*> bindingSets;
         std::vector<uint64_t> bindingSetVersions;
 
         bool operator==(const MetalArgumentTableCacheKey& other) const
@@ -183,8 +208,17 @@ namespace nvrhi::metal3
         NSUInteger bufferSize = 0;
         id<MTLSamplerState> sampler = nil;
         float samplerMipBias = 0.f;
+        uint32_t textureViewOffsetInElements = 0;
 
         MTLResourceUsage usage = MTLResourceUsageRead;
+    };
+
+    bool encodeMetalBindingResource(IRDescriptorTableEntry* entry, const MetalBindingResource& resource);
+
+    struct DescriptorTableSnapshot
+    {
+        id<MTLBuffer> buffer = nil;
+        std::vector<MetalBindingResource> entries;
     };
 
     class UploadManager
@@ -318,11 +352,16 @@ namespace nvrhi::metal3
     {
     public:
         TextureDesc desc;
+        TextureStateExtension stateExtension{desc};
         id<MTLTexture> texture = nil;
         NSUInteger memSize;
         NSUInteger memAlign;
         bool ownsTexture = true;
 
+        std::mutex viewMutex;
+        std::vector<id<MTLTexture>> views;
+        id<MTLTexture> getView(Format format, TextureSubresourceSet subresources, TextureDimension dimension,
+            std::optional<ComponentMapping> componentMapping = std::nullopt);
         const TextureDesc& getDesc() const override { return desc; }
         Object getNativeObject(ObjectType objectType) override;
         Object getNativeView(ObjectType objectType, Format format = Format::UNKNOWN, TextureSubresourceSet subresources = AllSubresources, TextureDimension dimension = TextureDimension::Unknown, bool isReadOnlyDSV = false, std::optional<ComponentMapping> overrideComponentMapping = std::nullopt) override;
@@ -333,6 +372,7 @@ namespace nvrhi::metal3
     {
     public:
         BufferDesc desc;
+        BufferStateExtension stateExtension{desc};
         id<MTLBuffer> buffer = nil;
         bool ownsBuffer = true;
 
@@ -453,12 +493,59 @@ namespace nvrhi::metal3
         IBindingLayout* getLayout() const override { return layout; }
     };
 
+    class DescriptorTable : public RefCounter<IDescriptorTable>
+    {
+    public:
+        BindingLayoutHandle layout;
+        mutable std::mutex mutex;
+        std::vector<MetalBindingResource> entries;
+        std::shared_ptr<DescriptorTableSnapshot> snapshot;
+        uint64_t version = 1;
+        const BindingSetDesc* getDesc() const override { return nullptr; }
+        IBindingLayout* getLayout() const override { return layout; }
+        uint32_t getCapacity() const override;
+        uint32_t getFirstDescriptorIndexInHeap() const override { return 0; }
+        std::shared_ptr<DescriptorTableSnapshot> getSnapshot(const MTL3Context& context);
+    };
+
     struct TrackedCommandBuffer
     {
         id<MTLCommandBuffer> commandBuffer = nil;
         std::vector<BindingSetHandle> bindingSets;
         std::vector<id<MTLBuffer>> buffers;
         std::vector<id<MTLResource>> resources;
+        std::vector<std::shared_ptr<DescriptorTableSnapshot>> descriptorSnapshots;
+        std::vector<ResourceHandle> stateResources;
+    };
+
+    struct TimerQueryPool
+    {
+        static constexpr NSUInteger QueriesPerPage = 256;
+
+        struct Page
+        {
+            id<MTLCounterSampleBuffer> samples = nil;
+            std::vector<NSUInteger> freeSamples;
+        };
+
+        std::mutex mutex;
+        std::vector<Page> pages;
+        id<MTLCounterSet> counterSet = nil;
+        uint64_t frequency = 0;
+    };
+
+    class TimerQuery : public RefCounter<ITimerQuery>
+    {
+    public:
+        ~TimerQuery() override;
+        std::shared_ptr<TimerQueryPool> pool;
+        size_t pageIndex = 0;
+        NSUInteger sampleIndex = 0;
+        id<MTLCounterSampleBuffer> samples = nil;
+        id<MTLCommandBuffer> commandBuffer = nil;
+        bool started = false;
+        bool ended = false;
+        uint64_t frequency = 0;
     };
 
     class CommandListLifetimeTracker : public RefCounter<ICommandListLifetimeTracker>
@@ -646,6 +733,8 @@ namespace nvrhi::metal3
         // completion, but must not create a native MTLBuffer per draw.
         UploadManager m_ArgumentTableManager;
         TransientIndirectResourcePool m_TransientIndirectResources;
+        CommandListResourceStateTracker m_StateTracker;
+        bool m_EnableAutomaticBarriers = true;
         
         CommandListParameters m_Desc;
 
@@ -671,6 +760,8 @@ namespace nvrhi::metal3
         std::vector<BindingSetHandle> m_ReferencedBindingSets;
         std::vector<id<MTLBuffer>> m_ReferencedNativeBuffers;
         std::vector<id<MTLResource>> m_ReferencedNativeResources;
+        std::vector<std::shared_ptr<DescriptorTableSnapshot>> m_ReferencedDescriptorSnapshots;
+        std::vector<ResourceHandle> m_ReferencedStateResources;
 
         std::vector<MetalArgumentTableCacheEntry> m_ArgumentTableCache;
         uint64_t m_ArgumentTableAllocationCount = 0;
@@ -697,6 +788,8 @@ namespace nvrhi::metal3
         void useArgumentTableResource(id<MTLRenderCommandEncoder> encoder, const MetalBindingResource& resource, MTLRenderStages stages);
         void useArgumentTableResources(id<MTLComputeCommandEncoder> encoder, const BindingSetVector& bindingSets, const MetalStageBindingPlan& plan);
         void useArgumentTableResources(id<MTLRenderCommandEncoder> encoder, const BindingSetVector& bindingSets, const MetalStageBindingPlan& plan, MTLRenderStages stages);
+        void bindDescriptorTables(id<MTLRenderCommandEncoder> encoder, const BindingSetVector& bindingSets, const MetalStageBindingPlan& plan, MTLRenderStages stages);
+        void bindDescriptorTables(id<MTLComputeCommandEncoder> encoder, const BindingSetVector& bindingSets, const MetalStageBindingPlan& plan);
         bool bindGeometryEmulationVertexBuffers(id<MTLRenderCommandEncoder> encoder, const GraphicsPipeline& pipeline, const GraphicsState& state);
         void drawIndirectGeometryEmulation(uint32_t offsetBytes, uint32_t drawCount);
         void drawIndexedIndirectGeometryEmulation(uint32_t offsetBytes, uint32_t drawCount);
@@ -704,7 +797,7 @@ namespace nvrhi::metal3
         void applyGraphicsStateToEncoder(id<MTLRenderCommandEncoder> encoder, const GraphicsState& state);
         void applyGraphicsBindings(id<MTLRenderCommandEncoder> encoder, const GraphicsState& state);
         void applyComputeBindings(id<MTLComputeCommandEncoder> encoder, const ComputeState& state);
-        void referenceBindingSet(BindingSet* bindingSet);
+        void referenceBindingSet(IBindingSet* bindingSet);
 #if defined(NVRHI_METAL3_WITH_TRACY) && defined(TRACY_ENABLE)
         tracy::SourceLocationData* getOrCreateTracySourceLocation();
         void beginTracyRenderEncoderZone(MTLRenderPassDescriptor* desc);
@@ -868,6 +961,7 @@ namespace nvrhi::metal3
         EventQuery* getEventQuery(IEventQuery* query);
         std::array<QueueState, uint32_t(CommandQueue::Count)> m_Queues;
         std::array<RefCountPtr<CommandListLifetimeTracker>, uint32_t(CommandQueue::Count)> m_DefaultLifetimeTrackers;
+        std::shared_ptr<TimerQueryPool> m_TimerQueryPool = std::make_shared<TimerQueryPool>();
 
         CommandList* m_OpenImmediateCommandList = nullptr;
 

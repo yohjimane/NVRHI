@@ -4,7 +4,7 @@ namespace nvrhi::metal3
 {
     static MTLTextureUsage textureUsageFromDesc(const TextureDesc& desc)
     {
-        MTLTextureUsage usage = MTLTextureUsageUnknown;
+        MTLTextureUsage usage = MTLTextureUsagePixelFormatView;
         if (desc.isShaderResource)
             usage |= MTLTextureUsageShaderRead;
         if (desc.isUAV)
@@ -111,13 +111,65 @@ namespace nvrhi::metal3
         return nullptr;
     }
 
+    static MTLTextureSwizzle convertSwizzle(ComponentSwizzle swizzle)
+    {
+        switch (swizzle)
+        {
+        case ComponentSwizzle::R: return MTLTextureSwizzleRed;
+        case ComponentSwizzle::G: return MTLTextureSwizzleGreen;
+        case ComponentSwizzle::B: return MTLTextureSwizzleBlue;
+        case ComponentSwizzle::A: return MTLTextureSwizzleAlpha;
+        case ComponentSwizzle::Zero: return MTLTextureSwizzleZero;
+        case ComponentSwizzle::One: return MTLTextureSwizzleOne;
+        }
+        return MTLTextureSwizzleZero;
+    }
+
+    id<MTLTexture> Texture::getView(Format format, TextureSubresourceSet subresources, TextureDimension dimension,
+        std::optional<ComponentMapping> componentMapping)
+    {
+        if (!texture)
+            return nil;
+        const ComponentMapping mapping = resolveComponentMapping(componentMapping, desc.defaultComponentMapping);
+        format = format == Format::UNKNOWN ? desc.format : format;
+        dimension = dimension == TextureDimension::Unknown ? desc.dimension : dimension;
+        if (format == desc.format && dimension == desc.dimension && subresources.isEntireTexture(desc) && mapping.isIdentity())
+            return texture;
+        subresources = subresources.resolve(desc, false);
+        if (!subresources.numMipLevels || !subresources.numArraySlices)
+            return nil;
+        const MTLPixelFormat pixelFormat = convertFormat(format);
+        if (pixelFormat == MTLPixelFormatInvalid)
+            return nil;
+        const MTLTextureType type = convertTextureDimension(dimension, desc.sampleCount);
+        const MTLTextureSwizzleChannels swizzle = MTLTextureSwizzleChannelsMake(convertSwizzle(mapping.r),
+            convertSwizzle(mapping.g), convertSwizzle(mapping.b), convertSwizzle(mapping.a));
+        const NSUInteger sliceCount = dimension == TextureDimension::Texture3D ? 1 : subresources.numArraySlices;
+        std::lock_guard<std::mutex> lock(viewMutex);
+        for (id<MTLTexture> view : views)
+        {
+            const MTLTextureSwizzleChannels existing = view.swizzle;
+            const NSUInteger viewSlices = (type == MTLTextureTypeCube || type == MTLTextureTypeCubeArray) ? view.arrayLength * 6 : view.arrayLength;
+            if (view.pixelFormat == pixelFormat && view.textureType == type &&
+                view.parentRelativeLevel == subresources.baseMipLevel &&
+                view.mipmapLevelCount == subresources.numMipLevels &&
+                view.parentRelativeSlice == subresources.baseArraySlice && viewSlices == sliceCount &&
+                existing.red == swizzle.red && existing.green == swizzle.green &&
+                existing.blue == swizzle.blue && existing.alpha == swizzle.alpha)
+                return view;
+        }
+        id<MTLTexture> view = [texture newTextureViewWithPixelFormat:pixelFormat textureType:type
+            levels:NSMakeRange(subresources.baseMipLevel, subresources.numMipLevels)
+            slices:NSMakeRange(subresources.baseArraySlice, sliceCount) swizzle:swizzle];
+        if (view)
+            views.push_back(view);
+        return view;
+    }
+
     Object Texture::getNativeView(ObjectType objectType, Format format, TextureSubresourceSet subresources, TextureDimension dimension, bool, std::optional<ComponentMapping> overrideComponentMapping)
     {
-        if ((format != Format::UNKNOWN && format != desc.format)
-            || !subresources.isEntireTexture(desc)
-            || (dimension != TextureDimension::Unknown && dimension != desc.dimension)
-            || !resolveComponentMapping(overrideComponentMapping, desc.defaultComponentMapping).isIdentity())
+        if (objectType != ObjectTypes::MTL3_Texture)
             return nullptr;
-        return getNativeObject(objectType);
+        return Object((__bridge void*)getView(format, subresources, dimension, overrideComponentMapping));
     }
 }

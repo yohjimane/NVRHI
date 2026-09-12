@@ -966,31 +966,20 @@ namespace nvrhi::metal3
 
         for (IBindingSet* bindingSet : bindingSets)
         {
-            auto* set = static_cast<BindingSet*>(bindingSet);
-            key.bindingSets.push_back(set);
-            key.bindingSetVersions.push_back(set ? set->version : 0);
+            key.bindingSets.push_back(bindingSet);
+            if (bindingSet && !bindingSet->getDesc())
+            {
+                auto* table = static_cast<DescriptorTable*>(bindingSet);
+                std::lock_guard<std::mutex> lock(table->mutex);
+                key.bindingSetVersions.push_back(table->version);
+            }
+            else
+                key.bindingSetVersions.push_back(bindingSet ? static_cast<BindingSet*>(bindingSet)->version : 0);
         }
 
         return key;
     }
 
-    static bool isVolatileConstantBufferPlanEntry(const MetalBindingPlanEntry& planEntry)
-    {
-        return planEntry.layoutMatched &&
-            planEntry.argumentType == MscArgumentType::CBV &&
-            planEntry.layoutType == ResourceType::VolatileConstantBuffer;
-    }
-
-    static bool planContainsVolatileConstantBuffer(const MetalStageBindingPlan& plan)
-    {
-        for (const MetalBindingPlanEntry& entry : plan.entries)
-        {
-            if (isVolatileConstantBufferPlanEntry(entry))
-                return true;
-        }
-
-        return false;
-    }
 
     static bool isSrvType(ResourceType type)
     {
@@ -1068,6 +1057,8 @@ namespace nvrhi::metal3
     {
         if (!planEntry.layoutMatched || planEntry.layoutIndex >= bindingSets.size())
             return nullptr;
+        if (!bindingSets[planEntry.layoutIndex] || !bindingSets[planEntry.layoutIndex]->getDesc())
+            return nullptr;
 
         auto* set = static_cast<BindingSet*>(bindingSets[planEntry.layoutIndex]);
         if (!set)
@@ -1089,65 +1080,22 @@ namespace nvrhi::metal3
 
     bool CommandList::encodeArgumentTableEntry(IRDescriptorTableEntry* entry, const MetalBindingResource& resource)
     {
-        switch (resource.type)
-        {
-        case ResourceType::Texture_SRV:
-        case ResourceType::Texture_UAV:
-            if (!resource.texture)
-                return false;
-            IRDescriptorTableSetTexture(entry, resource.texture, 0.f, 0);
-            return true;
-        case ResourceType::Sampler:
-            if (!resource.sampler)
-                return false;
-            IRDescriptorTableSetSampler(entry, resource.sampler, resource.samplerMipBias);
-            return true;
-        case ResourceType::VolatileConstantBuffer:
-        {
-            auto* buffer = static_cast<Buffer*>(resource.resource.Get());
-            auto allocationIt = buffer ? m_VolatileBufferAllocations.find(buffer) : m_VolatileBufferAllocations.end();
-            if (!buffer || allocationIt == m_VolatileBufferAllocations.end() || !allocationIt->second.allocation.buffer)
-                return false;
-
-            const VolatileBufferAllocation& volatileAllocation = allocationIt->second;
-            if (resource.bufferOffset >= volatileAllocation.writtenSize)
-                return false;
-
-            IRBufferView view{};
-            view.buffer = volatileAllocation.allocation.buffer;
-            view.bufferOffset = volatileAllocation.allocation.offset + resource.bufferOffset;
-            view.bufferSize = NSUInteger(volatileAllocation.writtenSize - resource.bufferOffset);
-            view.textureBufferView = nil;
-            view.textureViewOffsetInElements = 0;
-            view.typedBuffer = false;
-            IRDescriptorTableSetBufferView(entry, &view);
-            m_ReferencedNativeBuffers.push_back(volatileAllocation.allocation.buffer);
-            return true;
-        }
-        case ResourceType::ConstantBuffer:
-        case ResourceType::TypedBuffer_SRV:
-        case ResourceType::TypedBuffer_UAV:
-        case ResourceType::StructuredBuffer_SRV:
-        case ResourceType::StructuredBuffer_UAV:
-        case ResourceType::RawBuffer_SRV:
-        case ResourceType::RawBuffer_UAV:
-        {
-            if (!resource.buffer)
-                return false;
-
-            IRBufferView view{};
-            view.buffer = resource.buffer;
-            view.bufferOffset = resource.bufferOffset;
-            view.bufferSize = resource.bufferSize;
-            view.textureBufferView = nil;
-            view.textureViewOffsetInElements = 0;
-            view.typedBuffer = false;
-            IRDescriptorTableSetBufferView(entry, &view);
-            return true;
-        }
-        default:
+        if (resource.type != ResourceType::VolatileConstantBuffer)
+            return encodeMetalBindingResource(entry, resource);
+        auto* buffer = static_cast<Buffer*>(resource.resource.Get());
+        auto allocationIt = buffer ? m_VolatileBufferAllocations.find(buffer) : m_VolatileBufferAllocations.end();
+        if (allocationIt == m_VolatileBufferAllocations.end() || !allocationIt->second.allocation.buffer)
             return false;
-        }
+        const VolatileBufferAllocation& allocation = allocationIt->second;
+        if (resource.bufferOffset >= allocation.writtenSize)
+            return false;
+        IRBufferView view{};
+        view.buffer = allocation.allocation.buffer;
+        view.bufferOffset = allocation.allocation.offset + resource.bufferOffset;
+        view.bufferSize = std::min(resource.bufferSize, NSUInteger(allocation.writtenSize - resource.bufferOffset));
+        IRDescriptorTableSetBufferView(entry, &view);
+        m_ReferencedNativeBuffers.push_back(allocation.allocation.buffer);
+        return true;
     }
 
     void CommandList::useArgumentTableResource(id<MTLComputeCommandEncoder> encoder, const MetalBindingResource& resource)
@@ -1170,6 +1118,8 @@ namespace nvrhi::metal3
         default:
             if (isBufferType(resource.type) && resource.buffer)
                 [encoder useResource:resource.buffer usage:resource.usage];
+            if (resource.texture)
+                [encoder useResource:resource.texture usage:resource.usage];
             break;
         }
     }
@@ -1194,6 +1144,8 @@ namespace nvrhi::metal3
         default:
             if (isBufferType(resource.type) && resource.buffer)
                 [encoder useResource:resource.buffer usage:resource.usage stages:stages];
+            if (resource.texture)
+                [encoder useResource:resource.texture usage:resource.usage stages:stages];
             break;
         }
     }
@@ -1609,6 +1561,7 @@ namespace nvrhi::metal3
             , m_ArgumentTableManager(context, c_ArgumentTablePageSize, 0, false,
                 c_ArgumentTablePageSize, c_ArgumentTableInitialPageCount)
             , m_TransientIndirectResources(context)
+            , m_StateTracker(context.messageCallback)
             , m_Desc(params) {}
         
     CommandList::~CommandList()
@@ -1718,6 +1671,7 @@ namespace nvrhi::metal3
             [m_ComputeEncoder endEncoding];
             m_ComputeEncoder = nil;
         }
+        m_BindingStatesDirty = true;
 #if defined(NVRHI_METAL3_WITH_TRACY) && defined(TRACY_ENABLE)
         m_TracyEncoderScope.reset();
 #endif
@@ -1763,6 +1717,11 @@ namespace nvrhi::metal3
         m_ReferencedBindingSets.clear();
         m_ReferencedNativeBuffers.clear();
         m_ReferencedNativeResources.clear();
+        m_ReferencedDescriptorSnapshots.clear();
+        m_ReferencedStateResources.clear();
+        m_StateTracker = CommandListResourceStateTracker(m_Context.messageCallback);
+        m_PushConstantSize = 0;
+        m_BindingStatesDirty = true;
         m_ArgumentTableCache.clear();
         m_UploadManager.beginCommandBuffer();
         m_ArgumentTableManager.beginCommandBuffer();
@@ -1787,6 +1746,9 @@ namespace nvrhi::metal3
             return;
         }
         endEncoding();
+        m_StateTracker.keepBufferInitialStates();
+        m_StateTracker.keepTextureInitialStates();
+        commitBarriers();
         m_RecordingState = RecordingState::Closed;
         if (m_Device->m_OpenImmediateCommandList == this)
             m_Device->m_OpenImmediateCommandList = nullptr;
@@ -1818,11 +1780,14 @@ namespace nvrhi::metal3
         m_UploadManager.submitCommandBuffer(trackedCmdBuffer);
         m_ArgumentTableManager.submitCommandBuffer(trackedCmdBuffer);
         m_TransientIndirectResources.submitCommandBuffer(trackedCmdBuffer);
+        m_StateTracker.commandListSubmitted();
         m_LifetimeTracker->m_CommandBuffers.push_back({
             trackedCmdBuffer,
             std::move(m_ReferencedBindingSets),
             std::move(m_ReferencedNativeBuffers),
-            std::move(m_ReferencedNativeResources)
+            std::move(m_ReferencedNativeResources),
+            std::move(m_ReferencedDescriptorSnapshots),
+            std::move(m_ReferencedStateResources)
         });
         [trackedCmdBuffer commit];
         m_RecordingState = RecordingState::Submitted;
@@ -1842,36 +1807,63 @@ namespace nvrhi::metal3
 
     void CommandList::clearTextureFloat(ITexture* t, TextureSubresourceSet subresources, const Color& clearColor)
     {
-        (void)subresources;
         auto* texture = static_cast<Texture*>(t);
         if (!texture || !texture->texture)
             return;
-
-        MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
-        rp.colorAttachments[0].texture = texture->texture;
-        rp.colorAttachments[0].loadAction = MTLLoadActionClear;
-        rp.colorAttachments[0].storeAction = MTLStoreActionStore;
-        rp.colorAttachments[0].clearColor = MTLClearColorMake(clearColor.r, clearColor.g, clearColor.b, clearColor.a);
+        subresources = subresources.resolve(texture->desc, false);
         endEncoding();
-        id<MTLRenderCommandEncoder> encoder = [trackedCmdBuffer renderCommandEncoderWithDescriptor:rp];
-        [encoder endEncoding];
+        for (uint32_t mip = subresources.baseMipLevel; mip < subresources.baseMipLevel + subresources.numMipLevels; ++mip)
+        {
+            for (uint32_t slice = subresources.baseArraySlice; slice < subresources.baseArraySlice + subresources.numArraySlices; ++slice)
+            {
+                MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
+                rp.colorAttachments[0].texture = texture->texture;
+                rp.colorAttachments[0].level = mip;
+                rp.colorAttachments[0].slice = slice;
+                rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+                rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+                rp.colorAttachments[0].clearColor = MTLClearColorMake(clearColor.r, clearColor.g, clearColor.b, clearColor.a);
+                id<MTLRenderCommandEncoder> encoder = [trackedCmdBuffer renderCommandEncoderWithDescriptor:rp];
+                [encoder endEncoding];
+            }
+        }
     }
-    
+
     void CommandList::clearDepthStencilTexture(ITexture* t, TextureSubresourceSet subresources, bool clearDepth, float depth, bool clearStencil, uint8_t stencil)
     {
-        (void)subresources; (void)clearStencil; (void)stencil;
         auto* texture = static_cast<Texture*>(t);
-        if (!texture || !texture->texture || !clearDepth)
+        if (!texture || !texture->texture || (!clearDepth && !clearStencil))
             return;
-
-        MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
-        rp.depthAttachment.texture = texture->texture;
-        rp.depthAttachment.loadAction = MTLLoadActionClear;
-        rp.depthAttachment.storeAction = MTLStoreActionStore;
-        rp.depthAttachment.clearDepth = depth;
+        subresources = subresources.resolve(texture->desc, false);
+        const FormatInfo& format = getFormatInfo(texture->desc.format);
         endEncoding();
-        id<MTLRenderCommandEncoder> encoder = [trackedCmdBuffer renderCommandEncoderWithDescriptor:rp];
-        [encoder endEncoding];
+        for (uint32_t mip = subresources.baseMipLevel; mip < subresources.baseMipLevel + subresources.numMipLevels; ++mip)
+        {
+            for (uint32_t slice = subresources.baseArraySlice; slice < subresources.baseArraySlice + subresources.numArraySlices; ++slice)
+            {
+                MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
+                if (format.hasDepth)
+                {
+                    rp.depthAttachment.texture = texture->texture;
+                    rp.depthAttachment.level = mip;
+                    rp.depthAttachment.slice = slice;
+                    rp.depthAttachment.loadAction = clearDepth ? MTLLoadActionClear : MTLLoadActionLoad;
+                    rp.depthAttachment.storeAction = MTLStoreActionStore;
+                    rp.depthAttachment.clearDepth = depth;
+                }
+                if (format.hasStencil)
+                {
+                    rp.stencilAttachment.texture = texture->texture;
+                    rp.stencilAttachment.level = mip;
+                    rp.stencilAttachment.slice = slice;
+                    rp.stencilAttachment.loadAction = clearStencil ? MTLLoadActionClear : MTLLoadActionLoad;
+                    rp.stencilAttachment.storeAction = MTLStoreActionStore;
+                    rp.stencilAttachment.clearStencil = stencil;
+                }
+                id<MTLRenderCommandEncoder> encoder = [trackedCmdBuffer renderCommandEncoderWithDescriptor:rp];
+                [encoder endEncoding];
+            }
+        }
     }
 
     void CommandList::clearTextureUInt(ITexture* t, TextureSubresourceSet subresources, uint32_t clearColor)
@@ -2064,15 +2056,24 @@ namespace nvrhi::metal3
         // if isVolatile, write into the CPU-GPU shared mem directly and return
         if (buffer->desc.isVolatile)
         {
-            UploadAllocation allocation = m_UploadManager.suballocate(dataSize, 256);
+            UploadAllocation allocation = m_UploadManager.suballocate(buffer->desc.byteSize, 256);
             if (!allocation.buffer || !allocation.cpuAddress)
                 return;
 
-            memcpy(allocation.cpuAddress, data, dataSize);
+            if (destOffsetBytes != 0 || dataSize != buffer->desc.byteSize)
+            {
+                auto previous = m_VolatileBufferAllocations.find(buffer);
+                if (previous != m_VolatileBufferAllocations.end())
+                    std::memcpy(allocation.cpuAddress, previous->second.allocation.cpuAddress, buffer->desc.byteSize);
+                else
+                    std::memset(allocation.cpuAddress, 0, buffer->desc.byteSize);
+            }
+            std::memcpy(static_cast<uint8_t*>(allocation.cpuAddress) + destOffsetBytes, data, dataSize);
             VolatileBufferAllocation record;
             record.allocation = allocation;
-            record.writtenSize = dataSize;
+            record.writtenSize = buffer->desc.byteSize;
             m_VolatileBufferAllocations[buffer] = record;
+            m_BindingStatesDirty = true;
             return;
         }
 
@@ -2189,7 +2190,27 @@ namespace nvrhi::metal3
     {
         m_CurrentGraphicsState = state;
         m_CurrentGraphicsStateValid = true;
+        if (state.pipeline)
+            m_ReferencedStateResources.emplace_back(state.pipeline);
+        if (state.framebuffer)
+            m_ReferencedStateResources.emplace_back(state.framebuffer);
         endEncoding();
+        if (m_EnableAutomaticBarriers)
+        {
+            for (IBindingSet* bindingSet : state.bindings)
+                setResourceStatesForBindingSet(bindingSet);
+            for (const VertexBufferBinding& binding : state.vertexBuffers)
+                setBufferState(binding.buffer, ResourceStates::VertexBuffer);
+            setBufferState(state.indexBuffer.buffer, ResourceStates::IndexBuffer);
+            if (state.framebuffer)
+            {
+                for (const FramebufferAttachment& attachment : state.framebuffer->getDesc().colorAttachments)
+                    setTextureState(attachment.texture, attachment.subresources, ResourceStates::RenderTarget);
+                const FramebufferAttachment& depth = state.framebuffer->getDesc().depthAttachment;
+                setTextureState(depth.texture, depth.subresources, depth.isReadOnly ? ResourceStates::DepthRead : ResourceStates::DepthWrite);
+            }
+            commitBarriers();
+        }
         id<MTLRenderCommandEncoder> encoder = getOrCreateRenderEncoder();
         auto* pipeline = static_cast<GraphicsPipeline*>(state.pipeline);
         if (!encoder || !pipeline)
@@ -2237,6 +2258,14 @@ namespace nvrhi::metal3
             rp.depthAttachment.slice = attachment.subresources.baseArraySlice;
             rp.depthAttachment.loadAction = MTLLoadActionLoad;
             rp.depthAttachment.storeAction = MTLStoreActionStore;
+            if (depth && getFormatInfo(depth->desc.format).hasStencil)
+            {
+                rp.stencilAttachment.texture = depth->texture;
+                rp.stencilAttachment.level = attachment.subresources.baseMipLevel;
+                rp.stencilAttachment.slice = attachment.subresources.baseArraySlice;
+                rp.stencilAttachment.loadAction = MTLLoadActionLoad;
+                rp.stencilAttachment.storeAction = MTLStoreActionStore;
+            }
         }
 #if defined(NVRHI_METAL3_WITH_TRACY) && defined(TRACY_ENABLE)
         beginTracyRenderEncoderZone(rp);
@@ -2274,6 +2303,8 @@ namespace nvrhi::metal3
                 m_Context.warning("[metal3-trace] draw skipped: encoder/pipeline missing");
             return;
         }
+        if (m_BindingStatesDirty)
+            applyGraphicsStateToEncoder(encoder, m_CurrentGraphicsState);
         if (pipeline->usesGeometryEmulation)
         {
             if (!m_GeometryEmulationDrawStateValid)
@@ -2314,6 +2345,8 @@ namespace nvrhi::metal3
                 m_Context.warning("[metal3-trace] drawIndexed skipped: encoder/pipeline/index missing");
             return;
         }
+        if (m_BindingStatesDirty)
+            applyGraphicsStateToEncoder(encoder, m_CurrentGraphicsState);
         if (pipeline->usesGeometryEmulation)
         {
             if (!m_GeometryEmulationDrawStateValid)
@@ -3233,7 +3266,17 @@ namespace nvrhi::metal3
     {
         m_CurrentComputeState = state;
         m_CurrentComputeStateValid = true;
+        if (state.pipeline)
+            m_ReferencedStateResources.emplace_back(state.pipeline);
         endEncoding();
+        if (m_EnableAutomaticBarriers)
+        {
+            for (IBindingSet* bindingSet : state.bindings)
+                setResourceStatesForBindingSet(bindingSet);
+            if (state.indirectParams)
+                setBufferState(state.indirectParams, ResourceStates::IndirectArgument);
+            commitBarriers();
+        }
         id<MTLComputeCommandEncoder> encoder = getOrCreateComputeEncoder();
         auto* pipeline = static_cast<ComputePipeline*>(state.pipeline);
         if (!encoder || !pipeline)
@@ -3245,6 +3288,7 @@ namespace nvrhi::metal3
         }
 
         [encoder setComputePipelineState:pipeline->pipeline];
+        m_BindingStatesDirty = false;
         applyComputeBindings(encoder, state);
 
         const ArgumentTableAllocation allocation = getOrCreateArgumentTable(pipeline->computeBindingPlan, state.bindings);
@@ -3279,8 +3323,42 @@ namespace nvrhi::metal3
                 m_Context.warning("[metal3-trace] dispatch skipped: encoder/pipeline missing");
             return;
         }
+        if (m_BindingStatesDirty)
+        {
+            setComputeState(m_CurrentComputeState);
+            encoder = m_ComputeEncoder;
+            if (!encoder)
+                return;
+        }
         MTLSize threadsPerGroup = pipeline->threadsPerGroup;
         [encoder dispatchThreadgroups:MTLSizeMake(groupsX, groupsY, groupsZ) threadsPerThreadgroup:threadsPerGroup];
+    }
+
+    void CommandList::dispatchIndirect(uint32_t offsetBytes)
+    {
+        auto* arguments = static_cast<Buffer*>(m_CurrentComputeState.indirectParams);
+        auto* pipeline = static_cast<ComputePipeline*>(m_CurrentComputeState.pipeline);
+        if (m_RecordingState != RecordingState::Open || !m_CurrentComputeStateValid || !pipeline ||
+            !arguments || !arguments->buffer || !arguments->desc.isDrawIndirectArgs ||
+            offsetBytes % 4 != 0 || offsetBytes > arguments->desc.byteSize ||
+            arguments->desc.byteSize - offsetBytes < sizeof(DispatchIndirectArguments))
+        {
+            m_RecordingFailed = true;
+            m_Context.error("[metal3] Indirect dispatch requires a compute pipeline and an aligned argument-buffer range.");
+            return;
+        }
+        if (!m_ComputeEncoder || m_BindingStatesDirty)
+            setComputeState(m_CurrentComputeState);
+        if (!m_ComputeEncoder)
+        {
+            m_RecordingFailed = true;
+            m_Context.error("[metal3] Cannot create the indirect dispatch compute encoder.");
+            return;
+        }
+        m_ReferencedStateResources.emplace_back(arguments);
+        [m_ComputeEncoder useResource:arguments->buffer usage:MTLResourceUsageRead];
+        [m_ComputeEncoder dispatchThreadgroupsWithIndirectBuffer:arguments->buffer
+            indirectBufferOffset:offsetBytes threadsPerThreadgroup:pipeline->threadsPerGroup];
     }
 
     void CommandList::applyGraphicsStateToEncoder(id<MTLRenderCommandEncoder> encoder, const GraphicsState& state)
@@ -3297,6 +3375,11 @@ namespace nvrhi::metal3
         [encoder setDepthStencilState:pipeline->depthStencilState];
         [encoder setCullMode:pipeline->cullMode];
         [encoder setFrontFacingWinding:pipeline->frontWinding];
+        const DepthStencilState& depthStencil = pipeline->desc.renderState.depthStencilState;
+        [encoder setStencilReferenceValue:depthStencil.dynamicStencilRef ? state.dynamicStencilRefValue : depthStencil.stencilRefValue];
+        [encoder setBlendColorRed:state.blendConstantColor.r green:state.blendConstantColor.g
+            blue:state.blendConstantColor.b alpha:state.blendConstantColor.a];
+        m_BindingStatesDirty = false;
 
         for (const Viewport& vp : state.viewport.viewports)
             [encoder setViewport:MTLViewport{ vp.minX, vp.minY, vp.width(), vp.height(), vp.minZ, vp.maxZ }];
@@ -3308,7 +3391,7 @@ namespace nvrhi::metal3
             auto* buffer = static_cast<Buffer*>(vb.buffer);
             if (traceMetalRuntime() && !buffer)
                 m_Context.warning("[metal3-trace] null vertex buffer at slot " + std::to_string(vb.slot));
-            [encoder setVertexBuffer:buffer ? buffer->buffer : nil offset:NSUInteger(vb.offset) atIndex:vb.slot];
+            m_ReferencedNativeBuffers.push_back(buffer ? buffer->buffer : nil);
             [encoder setVertexBuffer:buffer ? buffer->buffer : nil offset:NSUInteger(vb.offset) atIndex:c_MscVertexBufferBindPoint + vb.slot];
         }
 
@@ -3351,130 +3434,77 @@ namespace nvrhi::metal3
     ArgumentTableAllocation CommandList::createArgumentTable(const MetalStageBindingPlan& plan, const BindingSetVector& bindingSets)
     {
         ArgumentTableAllocation allocation;
-        if (!plan.valid || plan.resourceCount == 0)
+        if (!plan.valid || !plan.argumentBufferSize)
             return allocation;
-
-        const size_t tableSize = sizeof(IRDescriptorTableEntry) * size_t(plan.resourceCount);
-        UploadAllocation upload = m_ArgumentTableManager.suballocate(tableSize, 256);
+        UploadAllocation upload = m_ArgumentTableManager.suballocate(size_t(plan.argumentBufferSize), 256);
         if (!upload.buffer || !upload.cpuAddress)
+        {
+            m_RecordingFailed = true;
+            m_Context.error("[nvrhi] Failed to allocate Metal shader argument table.");
             return allocation;
-
+        }
         allocation.buffer = upload.buffer;
         allocation.offset = upload.offset;
         allocation.cpuAddress = upload.cpuAddress;
         ++m_ArgumentTableAllocationCount;
-
-        auto* entries = static_cast<IRDescriptorTableEntry*>(allocation.cpuAddress);
-        std::memset(entries, 0, tableSize);
-
-        const bool traceArgumentTable = traceMetalRuntime();
-        if (traceArgumentTable)
+        std::memset(upload.cpuAddress, 0, size_t(plan.argumentBufferSize));
+        for (const auto& table : plan.descriptorTables)
         {
-            static int tableLogCount = 0;
-            if (tableLogCount++ < 64)
-                m_Context.info("[metal3-trace] descriptor table: shader='" + plan.debugName +
-                    "' stage=" + std::string(utils::ShaderStageToString(plan.stage)) +
-                    " resources=" + std::to_string(plan.resourceCount));
+            uint64_t address = 0;
+            if (table.descriptorCount)
+                address = upload.buffer.gpuAddress + upload.offset + table.descriptorOffset;
+            else
+            {
+                if (table.layoutIndex >= bindingSets.size() || !bindingSets[table.layoutIndex] ||
+                    bindingSets[table.layoutIndex]->getDesc())
+                {
+                    m_RecordingFailed = true;
+                    m_Context.error("[nvrhi] Missing Metal unbounded descriptor table for '" + plan.debugName +
+                        "', slot " + std::to_string(table.slot) + ", space " + std::to_string(table.space) + ".");
+                    continue;
+                }
+                auto* descriptorTable = static_cast<DescriptorTable*>(bindingSets[table.layoutIndex]);
+                auto snapshot = descriptorTable->getSnapshot(m_Context);
+                if (!snapshot || !snapshot->buffer)
+                {
+                    m_RecordingFailed = true;
+                    m_Context.error("[nvrhi] Cannot snapshot Metal unbounded descriptor table for '" + plan.debugName + "'.");
+                    continue;
+                }
+                address = snapshot->buffer.gpuAddress;
+                if (std::find(m_ReferencedDescriptorSnapshots.begin(), m_ReferencedDescriptorSnapshots.end(), snapshot) ==
+                    m_ReferencedDescriptorSnapshots.end())
+                    m_ReferencedDescriptorSnapshots.push_back(snapshot);
+            }
+            std::memcpy(static_cast<uint8_t*>(upload.cpuAddress) + table.byteOffset, &address, sizeof(address));
         }
-
-        for (const MetalBindingPlanEntry& planEntry : plan.entries)
+        for (const MetalBindingPlanEntry& entry : plan.entries)
         {
-            if (planEntry.argumentIndex >= plan.resourceCount)
-                continue;
-
-            if (!planEntry.layoutMatched)
+            const MetalBindingResource* resource = findArgumentTableResource(bindingSets, entry);
+            if (!resource)
             {
-                if (traceMetalRuntime())
-                {
-                    static int unmatchedPlanLogCount = 0;
-                    if (unmatchedPlanLogCount++ < 64)
-                        m_Context.warning("[metal3-trace] reflected " +
-                            std::string(utils::ShaderStageToString(plan.stage)) +
-                            " binding has no NVRHI layout match: arg=" + std::to_string(planEntry.argumentIndex) +
-                            " slot=" + std::to_string(planEntry.slot) +
-                            " space=" + std::to_string(planEntry.space));
-                }
+                m_RecordingFailed = true;
+                m_Context.error("[nvrhi] Missing Metal shader binding for '" + plan.debugName +
+                    "', slot " + std::to_string(entry.slot) + ", space " + std::to_string(entry.space) + ".");
                 continue;
             }
-
-            const MetalBindingResource* resource = findArgumentTableResource(bindingSets, planEntry);
-            if (resource)
+            if (!resource->resource)
+                continue;
+            auto* encoded = reinterpret_cast<IRDescriptorTableEntry*>(static_cast<uint8_t*>(upload.cpuAddress) + entry.byteOffset);
+            if (!encodeArgumentTableEntry(encoded, *resource))
             {
-                const bool encodedResource = encodeArgumentTableEntry(&entries[planEntry.argumentIndex], *resource);
-                if (!encodedResource && traceMetalRuntime())
-                {
-                    static int failedEncodeLogCount = 0;
-                    if (failedEncodeLogCount++ < 64)
-                        m_Context.warning("[metal3-trace] failed to encode descriptor entry: shader='" + plan.debugName +
-                            "' stage=" + std::string(utils::ShaderStageToString(plan.stage)) +
-                            " arg=" + std::to_string(planEntry.argumentIndex) +
-                            " slot=" + std::to_string(planEntry.slot) +
-                            " space=" + std::to_string(planEntry.space) +
-                            " type=" + resourceTypeName(resource->type));
-                }
-                if (traceArgumentTable)
-                {
-                    static int entryLogCount = 0;
-                    if (entryLogCount++ < 256)
-                    {
-                        std::string details = "[metal3-trace] descriptor entry: shader='" + plan.debugName +
-                            "' stage=" + std::string(utils::ShaderStageToString(plan.stage)) +
-                            " arg=" + std::to_string(planEntry.argumentIndex) +
-                            " slot=" + std::to_string(planEntry.slot) +
-                            " space=" + std::to_string(planEntry.space) +
-                            " type=" + resourceTypeName(resource->type);
-                        if (resource->type == ResourceType::VolatileConstantBuffer)
-                        {
-                            auto* buffer = static_cast<Buffer*>(resource->resource.Get());
-                            auto allocationIt = buffer ? m_VolatileBufferAllocations.find(buffer) : m_VolatileBufferAllocations.end();
-                            if (allocationIt != m_VolatileBufferAllocations.end() && allocationIt->second.allocation.buffer)
-                                details += " buffer='<volatile-upload>' offset=" +
-                                    std::to_string(allocationIt->second.allocation.offset + resource->bufferOffset) +
-                                    " size=" + std::to_string(allocationIt->second.writtenSize);
-                            else
-                                details += " volatile_allocation=<missing>";
-                        }
-                        else if (resource->buffer)
-                            details += " buffer='" + std::string(resource->buffer.label.UTF8String ?: "<unnamed>") +
-                                "' offset=" + std::to_string(resource->bufferOffset) +
-                                " size=" + std::to_string(resource->bufferSize) +
-                                " native_size=" + std::to_string(resource->buffer.length);
-                        else if (resource->texture)
-                            details += " texture='" + std::string(resource->texture.label.UTF8String ?: "<unnamed>") + "'";
-                        else if (resource->sampler)
-                            details += " sampler=<native>";
-                        else
-                            details += " native_resource=<null>";
-                        const IRDescriptorTableEntry& encoded = entries[planEntry.argumentIndex];
-                        std::ostringstream encodedFields;
-                        encodedFields << std::hex
-                            << " gpu_va=0x" << encoded.gpuVA
-                            << " texture_view_id=0x" << encoded.textureViewID
-                            << " metadata=0x" << encoded.metadata;
-                        details += encodedFields.str();
-                        m_Context.info(details);
-                    }
-                }
-            }
-            else if (traceMetalRuntime())
-            {
-                static int missingResourceLogCount = 0;
-                if (missingResourceLogCount++ < 64)
-                    m_Context.warning("[metal3-trace] no binding-set resource for reflected " +
-                        std::string(utils::ShaderStageToString(plan.stage)) +
-                        " binding: arg=" + std::to_string(planEntry.argumentIndex) +
-                        " slot=" + std::to_string(planEntry.slot) +
-                        " space=" + std::to_string(planEntry.space));
+                m_RecordingFailed = true;
+                m_Context.error("[nvrhi] Failed to encode Metal shader resource for '" + plan.debugName +
+                    "', slot " + std::to_string(entry.slot) + ", space " + std::to_string(entry.space) + ".");
             }
         }
-
         return allocation;
     }
 
     ArgumentTableAllocation CommandList::getOrCreateArgumentTable(const MetalStageBindingPlan& plan, const BindingSetVector& bindingSets)
     {
         ArgumentTableAllocation allocation;
-        if (!plan.valid || plan.resourceCount == 0)
+        if (!plan.valid || !plan.argumentBufferSize)
         {
             if (!plan.valid && traceMetalRuntime())
             {
@@ -3486,8 +3516,12 @@ namespace nvrhi::metal3
             return allocation;
         }
 
-        if (planContainsVolatileConstantBuffer(plan))
-            return createArgumentTable(plan, bindingSets);
+        for (const MetalBindingPlanEntry& entry : plan.entries)
+        {
+            const MetalBindingResource* resource = findArgumentTableResource(bindingSets, entry);
+            if (resource && resource->type == ResourceType::VolatileConstantBuffer)
+                return createArgumentTable(plan, bindingSets);
+        }
 
         MetalArgumentTableCacheKey key = makeArgumentTableCacheKey(plan, bindingSets);
         for (const MetalArgumentTableCacheEntry& entry : m_ArgumentTableCache)
@@ -3507,12 +3541,116 @@ namespace nvrhi::metal3
         return allocation;
     }
 
+    static bool isSamplerTable(const BindlessLayoutDesc& desc)
+    {
+        return desc.layoutType == BindlessLayoutDesc::LayoutType::MutableSampler ||
+            (desc.layoutType == BindlessLayoutDesc::LayoutType::Immutable &&
+                !desc.registerSpaces.empty() && desc.registerSpaces.front().type == ResourceType::Sampler);
+    }
+
+    void CommandList::bindDescriptorTables(id<MTLRenderCommandEncoder> encoder, const BindingSetVector& bindingSets,
+        const MetalStageBindingPlan& plan, MTLRenderStages stages)
+    {
+        bool bound[2]{};
+        for (IBindingSet* bindingSet : bindingSets)
+        {
+            if (!bindingSet || bindingSet->getDesc())
+                continue;
+            auto* table = static_cast<DescriptorTable*>(bindingSet);
+            const BindlessLayoutDesc& desc = *table->layout->getBindlessDesc();
+            if ((desc.visibility & plan.stage) == ShaderType::None)
+                continue;
+            const bool sampler = isSamplerTable(desc);
+            const bool direct = sampler ? plan.directlyIndexedSamplerHeap : plan.directlyIndexedResourceHeap;
+            if (direct)
+            {
+                if (bound[sampler])
+                {
+                    m_RecordingFailed = true;
+                    m_Context.error("[nvrhi] Metal supports one directly indexed table per heap per shader stage.");
+                    return;
+                }
+                bound[sampler] = true;
+            }
+            auto snapshot = table->getSnapshot(m_Context);
+            if (!snapshot)
+                continue;
+            if (std::find(m_ReferencedDescriptorSnapshots.begin(), m_ReferencedDescriptorSnapshots.end(), snapshot) ==
+                m_ReferencedDescriptorSnapshots.end())
+                m_ReferencedDescriptorSnapshots.push_back(snapshot);
+            const NSUInteger index = sampler ? kIRSamplerHeapBindPoint : kIRDescriptorHeapBindPoint;
+            if (direct)
+            {
+                if (stages & MTLRenderStageVertex)
+                    [encoder setVertexBuffer:snapshot->buffer offset:0 atIndex:index];
+                if (stages & MTLRenderStageFragment)
+                    [encoder setFragmentBuffer:snapshot->buffer offset:0 atIndex:index];
+                if (stages & MTLRenderStageObject)
+                    [encoder setObjectBuffer:snapshot->buffer offset:0 atIndex:index];
+                if (stages & MTLRenderStageMesh)
+                    [encoder setMeshBuffer:snapshot->buffer offset:0 atIndex:index];
+            }
+            [encoder useResource:snapshot->buffer usage:MTLResourceUsageRead stages:stages];
+            for (const MetalBindingResource& resource : snapshot->entries)
+                useArgumentTableResource(encoder, resource, stages);
+        }
+        if ((plan.directlyIndexedResourceHeap && !bound[0]) || (plan.directlyIndexedSamplerHeap && !bound[1]))
+        {
+            m_RecordingFailed = true;
+            m_Context.error("[nvrhi] Missing directly indexed Metal descriptor heap for '" + plan.debugName + "'.");
+        }
+    }
+
+    void CommandList::bindDescriptorTables(id<MTLComputeCommandEncoder> encoder, const BindingSetVector& bindingSets,
+        const MetalStageBindingPlan& plan)
+    {
+        bool bound[2]{};
+        for (IBindingSet* bindingSet : bindingSets)
+        {
+            if (!bindingSet || bindingSet->getDesc())
+                continue;
+            auto* table = static_cast<DescriptorTable*>(bindingSet);
+            const BindlessLayoutDesc& desc = *table->layout->getBindlessDesc();
+            if ((desc.visibility & ShaderType::Compute) == ShaderType::None)
+                continue;
+            const bool sampler = isSamplerTable(desc);
+            const bool direct = sampler ? plan.directlyIndexedSamplerHeap : plan.directlyIndexedResourceHeap;
+            if (direct)
+            {
+                if (bound[sampler])
+                {
+                    m_RecordingFailed = true;
+                    m_Context.error("[nvrhi] Metal supports one directly indexed table per heap per shader stage.");
+                    return;
+                }
+                bound[sampler] = true;
+            }
+            auto snapshot = table->getSnapshot(m_Context);
+            if (!snapshot)
+                continue;
+            if (std::find(m_ReferencedDescriptorSnapshots.begin(), m_ReferencedDescriptorSnapshots.end(), snapshot) ==
+                m_ReferencedDescriptorSnapshots.end())
+                m_ReferencedDescriptorSnapshots.push_back(snapshot);
+            if (direct)
+                [encoder setBuffer:snapshot->buffer offset:0 atIndex:sampler ? kIRSamplerHeapBindPoint : kIRDescriptorHeapBindPoint];
+            [encoder useResource:snapshot->buffer usage:MTLResourceUsageRead];
+            for (const MetalBindingResource& resource : snapshot->entries)
+                useArgumentTableResource(encoder, resource);
+        }
+        if ((plan.directlyIndexedResourceHeap && !bound[0]) || (plan.directlyIndexedSamplerHeap && !bound[1]))
+        {
+            m_RecordingFailed = true;
+            m_Context.error("[nvrhi] Missing directly indexed Metal descriptor heap for '" + plan.debugName + "'.");
+        }
+    }
+
     void CommandList::bindGraphicsArgumentTable(
         id<MTLRenderCommandEncoder> encoder,
         const BindingSetVector& bindingSets,
         const MetalStageBindingPlan& plan,
         MTLRenderStages stages)
     {
+        bindDescriptorTables(encoder, bindingSets, plan, stages);
         const ArgumentTableAllocation allocation = getOrCreateArgumentTable(plan, bindingSets);
         if (!allocation.buffer)
             return;
@@ -3646,40 +3784,21 @@ namespace nvrhi::metal3
     // emulation does not bind unused object/mesh/fragment stage buffers.
     void CommandList::applyGraphicsBindings(id<MTLRenderCommandEncoder> encoder, const GraphicsState& state)
     {
-        (void)encoder;
         for (IBindingSet* bindingSet : state.bindings)
-        {
-            auto* set = static_cast<BindingSet*>(bindingSet);
-            if (!set) continue;
-            referenceBindingSet(set);
-            for (const BindingSetItem& item : set->desc.bindings)
-            {
-                if (traceMetalRuntime() && !item.resourceHandle)
-                    m_Context.warning("[metal3-trace] graphics binding has null resource: type=" +
-                        std::string(resourceTypeName(item.type)) + " slot=" + std::to_string(item.slot));
-            }
-        }
+            referenceBindingSet(bindingSet);
     }
 
     void CommandList::applyComputeBindings(id<MTLComputeCommandEncoder> encoder, const ComputeState& state)
     {
         for (IBindingSet* bindingSet : state.bindings)
-        {
-            auto* set = static_cast<BindingSet*>(bindingSet);
-            if (!set) continue;
-            referenceBindingSet(set);
-            for (const BindingSetItem& item : set->desc.bindings)
-            {
-                if (traceMetalRuntime() && !item.resourceHandle)
-                    m_Context.warning("[metal3-trace] compute binding has null resource: type=" +
-                        std::string(resourceTypeName(item.type)) + " slot=" + std::to_string(item.slot));
-            }
-        }
+            referenceBindingSet(bindingSet);
+        if (state.pipeline)
+            bindDescriptorTables(encoder, state.bindings, static_cast<ComputePipeline*>(state.pipeline)->computeBindingPlan);
     }
 
-    void CommandList::referenceBindingSet(BindingSet* bindingSet)
+    void CommandList::referenceBindingSet(IBindingSet* bindingSet)
     {
-        if (bindingSet)
+        if (bindingSet && std::find(m_ReferencedBindingSets.begin(), m_ReferencedBindingSets.end(), bindingSet) == m_ReferencedBindingSets.end())
             m_ReferencedBindingSets.push_back(bindingSet);
     }
 
@@ -3706,9 +3825,9 @@ namespace nvrhi::metal3
         m_PushConstantSize = std::min(byteSize, m_PushConstants.size());
         if (data && m_PushConstantSize)
             std::memcpy(m_PushConstants.data(), data, m_PushConstantSize);
+        m_BindingStatesDirty = true;
     }
 
-    void CommandList::dispatchIndirect(uint32_t offsetBytes) { (void)offsetBytes; unsupported(__func__); }
     void CommandList::setMeshletState(const MeshletState& state) { (void)state; unsupported(__func__); }
     void CommandList::dispatchMesh(uint32_t groupsX, uint32_t groupsY, uint32_t groupsZ) { (void)groupsX; (void)groupsY; (void)groupsZ; unsupported(__func__); }
     void CommandList::dispatchMeshIndirect(uint32_t offsetBytes, uint32_t maxDrawCount) { (void)offsetBytes; (void)maxDrawCount; unsupported(__func__); }
@@ -3723,22 +3842,7 @@ namespace nvrhi::metal3
     void CommandList::buildTopLevelAccelStructFromBuffer(rt::IAccelStruct* as, nvrhi::IBuffer* instanceBuffer, uint64_t instanceBufferOffset, size_t numInstances, rt::AccelStructBuildFlags buildFlags) { (void)as; (void)instanceBuffer; (void)instanceBufferOffset; (void)numInstances; (void)buildFlags; unsupported(__func__); }
     void CommandList::executeMultiIndirectClusterOperation(const rt::cluster::OperationDesc& desc) { (void)desc; unsupported(__func__); }
     void CommandList::convertCoopVecMatrices(coopvec::ConvertMatrixLayoutDesc const* convertDescs, size_t numDescs) { (void)convertDescs; (void)numDescs; unsupported(__func__); }
-    void CommandList::beginTimerQuery(ITimerQuery* query) { (void)query; unsupported(__func__); }
-    void CommandList::endTimerQuery(ITimerQuery* query) { (void)query; unsupported(__func__); }
-    void CommandList::setEnableAutomaticBarriers(bool enable) { (void)enable; unsupported(__func__); }
-    void CommandList::setResourceStatesForBindingSet(IBindingSet* bindingSet) { (void)bindingSet; unsupported(__func__); }
-    void CommandList::setEnableUavBarriersForTexture(ITexture* texture, bool enableBarriers) { (void)texture; (void)enableBarriers; unsupported(__func__); }
-    void CommandList::setEnableUavBarriersForBuffer(IBuffer* buffer, bool enableBarriers) { (void)buffer; unsupported(__func__); }
-    void CommandList::beginTrackingTextureState(ITexture* texture, TextureSubresourceSet subresources, ResourceStates stateBits) { (void)texture; (void)subresources; (void)stateBits; unsupported(__func__); }
-    void CommandList::beginTrackingBufferState(IBuffer* buffer, ResourceStates stateBits) { (void)buffer; (void)stateBits; unsupported(__func__); }
-    void CommandList::setTextureState(ITexture* texture, TextureSubresourceSet subresources, ResourceStates stateBits) { (void)texture; (void)subresources; (void)stateBits; unsupported(__func__); }
-    void CommandList::setBufferState(IBuffer* buffer, ResourceStates stateBits) { (void)buffer; (void)stateBits; unsupported(__func__); }
     void CommandList::setAccelStructState(rt::IAccelStruct* as, ResourceStates stateBits) { (void)as; (void)stateBits; unsupported(__func__); }
-    void CommandList::setPermanentTextureState(ITexture* texture, ResourceStates stateBits) { (void)texture; (void)stateBits; unsupported(__func__); }
-    void CommandList::setPermanentBufferState(IBuffer* buffer, ResourceStates stateBits) { (void)buffer; (void)stateBits; unsupported(__func__); }
-    void CommandList::commitBarriers() { unsupported(__func__); }
-    ResourceStates CommandList::getTextureSubresourceState(ITexture* texture, ArraySlice arraySlice, MipLevel mipLevel) { (void)texture; (void)arraySlice; (void)mipLevel; unsupported(__func__); return ResourceStates::Unknown; }
-    ResourceStates CommandList::getBufferState(IBuffer* buffer) { (void)buffer; unsupported(__func__); return ResourceStates::Unknown; }
     void CommandList::clearSamplerFeedbackTexture(ISamplerFeedbackTexture* texture) { (void)texture; unsupported(__func__); }
     void CommandList::decodeSamplerFeedbackTexture(IBuffer* buffer, ISamplerFeedbackTexture* texture, Format format) { (void)buffer; (void)texture; (void)format; unsupported(__func__); }
     void CommandList::setSamplerFeedbackTextureState(ISamplerFeedbackTexture* texture, ResourceStates stateBits) { (void)texture; (void)stateBits; unsupported(__func__); }

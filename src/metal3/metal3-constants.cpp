@@ -45,6 +45,7 @@ namespace nvrhi::metal3
         case Format::RG16_FLOAT: return MTLVertexFormatHalf2;
         case Format::RGBA16_FLOAT: return MTLVertexFormatHalf4;
         case Format::RGBA8_UNORM: return MTLVertexFormatUChar4Normalized;
+        case Format::BGRA8_UNORM: return MTLVertexFormatUChar4Normalized_BGRA;
         case Format::RGBA8_UINT: return MTLVertexFormatUChar4;
         case Format::R16_UINT: return MTLVertexFormatUShort;
         case Format::RG16_UINT: return MTLVertexFormatUShort2;

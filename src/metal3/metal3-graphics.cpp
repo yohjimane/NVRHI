@@ -14,8 +14,8 @@ namespace nvrhi::metal3
                 result.push_back(static_cast<char>(std::tolower(ch)));
         }
 
-        while (!result.empty() && std::isdigit(static_cast<unsigned char>(result.back())))
-            result.pop_back();
+        if (!result.empty() && !std::isdigit(static_cast<unsigned char>(result.back())))
+            result.push_back('0');
 
         return result;
     }
@@ -28,12 +28,6 @@ namespace nvrhi::metal3
     // c_MetalMaxVertexAttributes -> just a guard for Metal’s vertex attribute descriptor array
     static constexpr uint32_t c_MetalMaxVertexAttributes = 31;
 
-    static void setVertexAttribute(MTLVertexDescriptor* vertexDescriptor, uint32_t attributeIndex, const VertexAttributeDesc& attr)
-    {
-        vertexDescriptor.attributes[attributeIndex].format = convertVertexFormat(attr.format);
-        vertexDescriptor.attributes[attributeIndex].offset = attr.offset;
-        vertexDescriptor.attributes[attributeIndex].bufferIndex = c_MscVertexBufferBindPoint + attr.bufferIndex;
-    }
 
     InputLayoutHandle Device::createInputLayout(const VertexAttributeDesc* d, uint32_t attributeCount, IShader* vertexShader)
     {
@@ -42,41 +36,42 @@ namespace nvrhi::metal3
         layout->attributes.assign(d, d + attributeCount);
         layout->vertexDescriptor = [[MTLVertexDescriptor alloc] init];
 
+        uint32_t location = 0;
         for (uint32_t index = 0; index < attributeCount; ++index)
         {
             const VertexAttributeDesc& attr = d[index];
-            uint32_t attributeIndex = index;
-            if (shader && !shader->mscReflection.vertexInputAttributes.empty())
+            const uint32_t bufferIndex = c_MscVertexBufferBindPoint + attr.bufferIndex;
+            const MTLVertexFormat format = convertVertexFormat(attr.format);
+            if (!attr.arraySize || bufferIndex >= 31 || format == MTLVertexFormatInvalid)
             {
-                const std::string semantic = normalizeMscVertexInputName(attr.name);
-                auto it = shader->mscReflection.vertexInputAttributes.find(semantic);
-                if (it != shader->mscReflection.vertexInputAttributes.end())
-                {
-                    /* 
-                    // MSC reflection reports the HLSL input-signature index.
-                    // The generated Metal entry point places user attributes
-                    // after its reserved ABI inputs, so Metal validation names
-                    // POSITION0 as attribute 11, RECT0 as 12, etc.
-                    */
-                    attributeIndex = c_MscVertexAttributeBase + it->second;
-                }
-                else
-                {
-                    static int missingSemanticLogCount = 0;
-                    if (missingSemanticLogCount++ < 32)
-                    {
-                        m_Context.warning("[metal3] vertex attribute '" + attr.name +
-                            "' was not found in MSC reflection for shader '" +
-                            (shader ? shader->desc.debugName : std::string("<null>")) +
-                            "'; using input-layout index " + std::to_string(index));
-                    }
-                }
+                m_Context.error("[metal3] Invalid vertex attribute format, array size or buffer index: " + attr.name);
+                delete layout;
+                return nullptr;
             }
-
-            if (attributeIndex < c_MetalMaxVertexAttributes)
-                setVertexAttribute(layout->vertexDescriptor, attributeIndex, attr);
-
-            uint32_t bufferIndex = c_MscVertexBufferBindPoint + attr.bufferIndex;
+            const std::string semantic = normalizeMscVertexInputName(attr.name);
+            const size_t suffix = semantic.find_last_not_of("0123456789");
+            const std::string prefix = semantic.substr(0, suffix + 1);
+            const uint32_t firstSemantic = static_cast<uint32_t>(std::stoul(semantic.substr(suffix + 1)));
+            for (uint32_t element = 0; element < attr.arraySize; ++element, ++location)
+            {
+                uint32_t attributeIndex = c_MscVertexAttributeBase + location;
+                if (shader && !shader->mscReflection.vertexInputAttributes.empty())
+                {
+                    const auto found = shader->mscReflection.vertexInputAttributes.find(prefix + std::to_string(firstSemantic + element));
+                    if (found == shader->mscReflection.vertexInputAttributes.end())
+                        continue;
+                    attributeIndex = c_MscVertexAttributeBase + found->second;
+                }
+                if (attributeIndex >= c_MetalMaxVertexAttributes)
+                {
+                    m_Context.error("[metal3] Vertex attribute exceeds Metal attribute limits: " + attr.name);
+                    delete layout;
+                    return nullptr;
+                }
+                layout->vertexDescriptor.attributes[attributeIndex].format = format;
+                layout->vertexDescriptor.attributes[attributeIndex].offset = attr.offset + element * getFormatInfo(attr.format).bytesPerBlock;
+                layout->vertexDescriptor.attributes[attributeIndex].bufferIndex = bufferIndex;
+            }
             layout->vertexDescriptor.layouts[bufferIndex].stride = attr.elementStride;
             layout->vertexDescriptor.layouts[bufferIndex].stepFunction = attr.isInstanced ? MTLVertexStepFunctionPerInstance : MTLVertexStepFunctionPerVertex;
             layout->vertexDescriptor.layouts[bufferIndex].stepRate = 1;
@@ -146,6 +141,8 @@ namespace nvrhi::metal3
         }
         if (fbinfo.depthFormat != Format::UNKNOWN)
             pd.depthAttachmentPixelFormat = convertFormat(fbinfo.depthFormat);
+        if (getFormatInfo(fbinfo.depthFormat).hasStencil)
+            pd.stencilAttachmentPixelFormat = convertFormat(fbinfo.depthFormat);
         pd.rasterSampleCount = fbinfo.sampleCount;
     }
 
@@ -284,6 +281,34 @@ namespace nvrhi::metal3
         return nil;
     }
 
+    static MTLStencilOperation convertStencilOp(StencilOp operation)
+    {
+        switch (operation)
+        {
+        case StencilOp::Keep: return MTLStencilOperationKeep;
+        case StencilOp::Zero: return MTLStencilOperationZero;
+        case StencilOp::Replace: return MTLStencilOperationReplace;
+        case StencilOp::IncrementAndClamp: return MTLStencilOperationIncrementClamp;
+        case StencilOp::DecrementAndClamp: return MTLStencilOperationDecrementClamp;
+        case StencilOp::Invert: return MTLStencilOperationInvert;
+        case StencilOp::IncrementAndWrap: return MTLStencilOperationIncrementWrap;
+        case StencilOp::DecrementAndWrap: return MTLStencilOperationDecrementWrap;
+        }
+        return MTLStencilOperationKeep;
+    }
+
+    static MTLStencilDescriptor* createStencilDescriptor(const DepthStencilState::StencilOpDesc& face, const DepthStencilState& state)
+    {
+        MTLStencilDescriptor* descriptor = [[MTLStencilDescriptor alloc] init];
+        descriptor.stencilCompareFunction = convertCompareFunction(face.stencilFunc);
+        descriptor.stencilFailureOperation = convertStencilOp(face.failOp);
+        descriptor.depthFailureOperation = convertStencilOp(face.depthFailOp);
+        descriptor.depthStencilPassOperation = convertStencilOp(face.passOp);
+        descriptor.readMask = state.stencilReadMask;
+        descriptor.writeMask = state.stencilWriteMask;
+        return descriptor;
+    }
+
     GraphicsPipelineHandle Device::createGraphicsPipeline(const GraphicsPipelineDesc& desc, FramebufferInfo const& fbinfo)
     {
         auto* vs = static_cast<Shader*>(desc.VS.Get());
@@ -331,6 +356,11 @@ namespace nvrhi::metal3
             ? convertCompareFunction(desc.renderState.depthStencilState.depthFunc)
             : MTLCompareFunctionAlways;
         dd.depthWriteEnabled = desc.renderState.depthStencilState.depthWriteEnable;
+        if (desc.renderState.depthStencilState.stencilEnable)
+        {
+            dd.frontFaceStencil = createStencilDescriptor(desc.renderState.depthStencilState.frontFaceStencil, desc.renderState.depthStencilState);
+            dd.backFaceStencil = createStencilDescriptor(desc.renderState.depthStencilState.backFaceStencil, desc.renderState.depthStencilState);
+        }
 
         GraphicsPipeline* pipeline = new GraphicsPipeline();
         pipeline->desc = desc;

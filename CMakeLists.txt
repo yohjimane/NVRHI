@@ -509,25 +509,47 @@ if (NVRHI_WITH_METAL3)
             "Download the SDK from https://developer.apple.com/metal/shader-converter/ "
             "(Apple Account sign-in required). No SDK is downloaded automatically.")
     endif()
-    find_program(NVRHI_METAL_SHADER_CONVERTER_EXECUTABLE
-        NAMES metal-shaderconverter
+    find_path(NVRHI_METAL_IRCONVERTER_INCLUDE_DIR
+        NAMES metal_irconverter/metal_irconverter.h
         HINTS "${NVRHI_METAL_SHADER_CONVERTER_ROOT}"
-        PATH_SUFFIXES bin)
-    message(STATUS "Metal Shader Converter runtime: ${NVRHI_METAL_IRCONVERTER_RUNTIME_INCLUDE_DIR}")
-    if(NVRHI_METAL_SHADER_CONVERTER_EXECUTABLE)
-        message(STATUS "Metal Shader Converter tool: ${NVRHI_METAL_SHADER_CONVERTER_EXECUTABLE}")
-    else()
-        message(STATUS "Metal Shader Converter tool not found; shader conversion requires a separate tool installation.")
+        PATHS /usr/local /opt/homebrew
+        PATH_SUFFIXES include
+        REQUIRED)
+    find_library(NVRHI_METAL_IRCONVERTER_LIBRARY
+        NAMES metalirconverter
+        HINTS "${NVRHI_METAL_SHADER_CONVERTER_ROOT}"
+        PATHS /usr/local /opt/homebrew
+        PATH_SUFFIXES lib
+        REQUIRED)
+    set(NVRHI_METAL_DXC_ROOT "" CACHE PATH "DXC SDK prefix for native Metal shader reflection")
+    find_path(NVRHI_METAL_DXC_INCLUDE_DIR dxcapi.h
+        HINTS "${NVRHI_METAL_DXC_ROOT}" PATH_SUFFIXES include/dxc include REQUIRED)
+    find_path(NVRHI_METAL_DXC_REFLECTION_INCLUDE_DIR d3d12shader.h
+        HINTS "${NVRHI_METAL_DXC_ROOT}" PATH_SUFFIXES include/directx include REQUIRED)
+    find_path(NVRHI_METAL_DXC_STUB_INCLUDE_DIR rpc.h
+        HINTS "${NVRHI_METAL_DXC_ROOT}" PATH_SUFFIXES include/wsl/stubs REQUIRED)
+    find_library(NVRHI_METAL_DXC_LIBRARY dxcompiler
+        HINTS "${NVRHI_METAL_DXC_ROOT}" PATH_SUFFIXES lib REQUIRED)
+    if(TARGET copy-dxcompiler)
+        add_dependencies(${nvrhi_metal3_target} copy-dxcompiler)
     endif()
+    message(STATUS "Metal Shader Converter runtime: ${NVRHI_METAL_IRCONVERTER_RUNTIME_INCLUDE_DIR}")
+    message(STATUS "Metal Shader Converter library: ${NVRHI_METAL_IRCONVERTER_LIBRARY}")
 
     set_source_files_properties(${src_metal3_impl} PROPERTIES LANGUAGE OBJCXX)
     target_compile_features(${nvrhi_metal3_target} PRIVATE cxx_std_17)
     target_compile_options(${nvrhi_metal3_target} PRIVATE "$<$<COMPILE_LANGUAGE:OBJCXX>:-fobjc-arc>")
     target_include_directories(${nvrhi_metal3_target}
         PRIVATE
-            ${NVRHI_METAL_IRCONVERTER_RUNTIME_INCLUDE_DIR})
+            ${NVRHI_METAL_IRCONVERTER_RUNTIME_INCLUDE_DIR}
+            ${NVRHI_METAL_IRCONVERTER_INCLUDE_DIR}
+            ${NVRHI_METAL_DXC_INCLUDE_DIR}
+            ${NVRHI_METAL_DXC_REFLECTION_INCLUDE_DIR}
+            ${NVRHI_METAL_DXC_STUB_INCLUDE_DIR})
     target_link_libraries(${nvrhi_metal3_target}
         PUBLIC
+            ${NVRHI_METAL_IRCONVERTER_LIBRARY}
+            ${NVRHI_METAL_DXC_LIBRARY}
             ${NVRHI_METAL_FRAMEWORK}
             ${NVRHI_FOUNDATION_FRAMEWORK}
             ${NVRHI_QUARTZCORE_FRAMEWORK})

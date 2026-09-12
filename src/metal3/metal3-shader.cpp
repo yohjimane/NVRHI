@@ -8,6 +8,20 @@
 #include <regex>
 #include <sstream>
 #include <unordered_map>
+#include <limits>
+#include <memory>
+#include <metal_irconverter/metal_irconverter.h>
+#include <metal_irconverter_runtime/metal_irconverter_runtime.h>
+#pragma push_macro("BOOL")
+#undef BOOL
+#define BOOL MetalDxcBOOL
+#include <dxcapi.h>
+#pragma push_macro("interface")
+#undef interface
+#define interface struct
+#include <d3d12shader.h>
+#pragma pop_macro("interface")
+#pragma pop_macro("BOOL")
 
 namespace nvrhi::metal3
 {
@@ -68,8 +82,8 @@ namespace nvrhi::metal3
                 result.push_back(static_cast<char>(std::tolower(ch)));
         }
 
-        while (!result.empty() && std::isdigit(static_cast<unsigned char>(result.back())))
-            result.pop_back();
+        if (!result.empty() && !std::isdigit(static_cast<unsigned char>(result.back())))
+            result.push_back('0');
 
         return result;
     }
@@ -256,6 +270,334 @@ namespace nvrhi::metal3
         return {};
     }
 
+    static std::string converterErrorDescription(const IRError* error)
+    {
+        if (!error)
+            return "no converter diagnostic";
+        const uint32_t code = IRErrorGetCode(error);
+        std::string message = "MSC error " + std::to_string(code);
+        switch (code)
+        {
+        case IRErrorCodeShaderRequiresRootSignature:
+            return message + ": shader requires an explicit root signature with directly indexed heap flags";
+        case IRErrorCodeUnrecognizedRootSignatureDescriptor:
+            return message + ": converter rejected the root signature descriptor version or flags";
+        case IRErrorCodeUnrecognizedParameterTypeInRootSignature:
+            return message + ": converter rejected a root parameter type";
+        case IRErrorCodeResourceNotReferencedByRootSignature:
+            return message + ": a shader register, space, or descriptor array extent is absent from the root signature";
+        case IRErrorCodeUnsupportedInstruction:
+            return message + ": DXIL contains an instruction unsupported by this converter";
+        case IRErrorCodeCompilationError:
+            return message + ": converter compilation failed";
+        case IRErrorCodeUnableToVerifyModule:
+            return message + ": converter could not verify the DXIL module";
+        case IRErrorCodeUnableToLinkModule:
+            return message + ": converter could not link the module; check SDK and deployment target compatibility";
+        case IRErrorCodeUnrecognizedDXILHeader:
+            return message + ": input is not a supported DXIL container";
+        default:
+            return message;
+        }
+    }
+
+    template<typename T>
+    struct DxcRelease
+    {
+        void operator()(T* object) const
+        {
+            if (object)
+                object->Release();
+        }
+    };
+
+    static IRRootSignature* createDxilRootSignature(const MTL3Context& context, Shader& shader,
+        const void* binary, size_t binarySize)
+    {
+        IDxcUtils* rawUtils = nullptr;
+        HRESULT result = DxcCreateInstance(CLSID_DxcUtils, IID_PPV_ARGS(&rawUtils));
+        std::unique_ptr<IDxcUtils, DxcRelease<IDxcUtils>> utils(rawUtils);
+        if (FAILED(result) || !utils)
+        {
+            context.error("[metal3] Cannot initialize DXC resource reflection for '" + shader.desc.debugName +
+                "', HRESULT " + std::to_string(uint32_t(result)));
+            return nullptr;
+        }
+        const DxcBuffer buffer{binary, binarySize, 0};
+        ID3D12ShaderReflection* rawReflection = nullptr;
+        result = utils->CreateReflection(&buffer, IID_PPV_ARGS(&rawReflection));
+        std::unique_ptr<ID3D12ShaderReflection, DxcRelease<ID3D12ShaderReflection>> reflection(rawReflection);
+        D3D12_SHADER_DESC desc{};
+        if (FAILED(result) || !reflection || FAILED(reflection->GetDesc(&desc)))
+        {
+            context.error("[metal3] Cannot reflect DXIL resources for '" + shader.desc.debugName +
+                "', HRESULT " + std::to_string(uint32_t(result)) + "; preserve DXIL reflection data");
+            return nullptr;
+        }
+
+        std::vector<std::vector<IRDescriptorRange1>> ranges(2);
+        std::vector<MscDescriptorTable> tables(2);
+        tables[1].type = MscArgumentType::Sampler;
+        auto& metadata = shader.mscReflection;
+        for (uint32_t i = 0; i < desc.BoundResources; ++i)
+        {
+            D3D12_SHADER_INPUT_BIND_DESC resource{};
+            if (FAILED(reflection->GetResourceBindingDesc(i, &resource)))
+            {
+                context.error("[metal3] Cannot reflect DXIL resource " + std::to_string(i) + " for '" + shader.desc.debugName + "'");
+                return nullptr;
+            }
+            MscArgumentBinding binding;
+            IRDescriptorRange1 range{};
+            switch (resource.Type)
+            {
+            case D3D_SIT_CBUFFER:
+                binding.type = MscArgumentType::CBV;
+                range.RangeType = IRDescriptorRangeTypeCBV;
+                break;
+            case D3D_SIT_TEXTURE:
+            case D3D_SIT_TBUFFER:
+            case D3D_SIT_STRUCTURED:
+            case D3D_SIT_BYTEADDRESS:
+                binding.type = MscArgumentType::SRV;
+                range.RangeType = IRDescriptorRangeTypeSRV;
+                break;
+            case D3D_SIT_UAV_RWTYPED:
+            case D3D_SIT_UAV_RWSTRUCTURED:
+            case D3D_SIT_UAV_RWBYTEADDRESS:
+                binding.type = MscArgumentType::UAV;
+                range.RangeType = IRDescriptorRangeTypeUAV;
+                break;
+            case D3D_SIT_SAMPLER:
+                binding.type = MscArgumentType::Sampler;
+                range.RangeType = IRDescriptorRangeTypeSampler;
+                break;
+            default:
+                context.error("[metal3] Unsupported DXIL resource type " + std::to_string(resource.Type) +
+                    " for '" + shader.desc.debugName + "', resource '" + (resource.Name ? resource.Name : "") +
+                    "', slot " + std::to_string(resource.BindPoint) + ", space " + std::to_string(resource.Space) +
+                    "; UAV counters and ray tracing root resources are not supported");
+                return nullptr;
+            }
+            const bool unbounded = resource.BindCount == 0 || resource.BindCount == UINT32_MAX;
+            uint32_t tableIndex = binding.type == MscArgumentType::Sampler ? 1 : 0;
+            if (unbounded)
+            {
+                tableIndex = uint32_t(tables.size());
+                tables.emplace_back();
+                tables.back().slot = resource.BindPoint;
+                tables.back().space = resource.Space;
+                tables.back().type = binding.type;
+                ranges.emplace_back();
+            }
+            auto& table = tables[tableIndex];
+            range.NumDescriptors = unbounded ? UINT32_MAX : resource.BindCount;
+            range.BaseShaderRegister = resource.BindPoint;
+            range.RegisterSpace = resource.Space;
+            range.Flags = static_cast<IRDescriptorRangeFlags>(IRDescriptorRangeFlagDescriptorsVolatile |
+                (binding.type == MscArgumentType::Sampler ? 0 : IRDescriptorRangeFlagDataVolatile));
+            range.OffsetInDescriptorsFromTableStart = table.descriptorCount;
+            ranges[tableIndex].push_back(range);
+            if (!unbounded)
+            {
+                if (resource.BindCount > UINT32_MAX / sizeof(IRDescriptorTableEntry) - table.descriptorCount ||
+                    resource.BindCount - 1 > UINT32_MAX - resource.BindPoint)
+                {
+                    context.error("[metal3] DXIL descriptor range exceeds the Metal argument buffer limit: " + shader.desc.debugName);
+                    return nullptr;
+                }
+                binding.tableIndex = tableIndex;
+                binding.index = table.descriptorCount;
+                binding.byteOffset = table.descriptorCount * sizeof(IRDescriptorTableEntry);
+                binding.sizeBytes = uint64_t(resource.BindCount) * sizeof(IRDescriptorTableEntry);
+                binding.slot = resource.BindPoint;
+                binding.space = resource.Space;
+                metadata.topLevelArgumentBuffer.push_back(binding);
+                table.descriptorCount += resource.BindCount;
+            }
+        }
+        std::vector<IRRootParameter1> parameters;
+        std::vector<uint32_t> tableIndices;
+        for (uint32_t i = 0; i < tables.size(); ++i)
+        {
+            if (ranges[i].empty())
+                continue;
+            IRRootParameter1 parameter{};
+            parameter.ParameterType = IRRootParameterTypeDescriptorTable;
+            parameter.ShaderVisibility = IRShaderVisibilityAll;
+            parameter.DescriptorTable.NumDescriptorRanges = uint32_t(ranges[i].size());
+            parameter.DescriptorTable.pDescriptorRanges = ranges[i].data();
+            parameters.push_back(parameter);
+            tableIndices.push_back(i);
+        }
+        IRVersionedRootSignatureDescriptor rootDesc{};
+        rootDesc.version = IRRootSignatureVersion_1_1;
+        rootDesc.desc_1_1.NumParameters = uint32_t(parameters.size());
+        rootDesc.desc_1_1.pParameters = parameters.data();
+        uint32_t flags = IRRootSignatureFlagAllowInputAssemblerInputLayout;
+        const uint64_t requiresFlags = reflection->GetRequiresFlags();
+        metadata.directlyIndexedResourceHeap = (requiresFlags & D3D_SHADER_REQUIRES_RESOURCE_DESCRIPTOR_HEAP_INDEXING) != 0;
+        metadata.directlyIndexedSamplerHeap = (requiresFlags & D3D_SHADER_REQUIRES_SAMPLER_DESCRIPTOR_HEAP_INDEXING) != 0;
+        if (requiresFlags & D3D_SHADER_REQUIRES_RESOURCE_DESCRIPTOR_HEAP_INDEXING)
+            flags |= IRRootSignatureFlagCBVSRVUAVHeapDirectlyIndexed;
+        if (requiresFlags & D3D_SHADER_REQUIRES_SAMPLER_DESCRIPTOR_HEAP_INDEXING)
+            flags |= IRRootSignatureFlagSamplerHeapDirectlyIndexed;
+        rootDesc.desc_1_1.Flags = static_cast<IRRootSignatureFlags>(flags);
+        IRError* error = nullptr;
+        std::unique_ptr<IRRootSignature, decltype(&IRRootSignatureDestroy)> root(
+            IRRootSignatureCreateFromDescriptor(&rootDesc, &error), IRRootSignatureDestroy);
+        if (!root)
+            context.error("[metal3] Cannot create root signature for '" + shader.desc.debugName + "': " + converterErrorDescription(error));
+        if (error)
+            IRErrorDestroy(error);
+        if (!root)
+            return nullptr;
+        std::vector<IRResourceLocation> locations(IRRootSignatureGetResourceCount(root.get()));
+        IRRootSignatureGetResourceLocations(root.get(), locations.data());
+        if (locations.size() != parameters.size())
+        {
+            context.error("[metal3] MSC root reflection does not match the descriptor table count: " + shader.desc.debugName);
+            return nullptr;
+        }
+        for (size_t i = 0; i < locations.size(); ++i)
+        {
+            const auto& location = locations[i];
+            if (location.resourceType != IRResourceTypeTable || location.sizeBytes != sizeof(uint64_t) ||
+                location.topLevelOffset > UINT32_MAX - sizeof(uint64_t))
+            {
+                context.error("[metal3] Unsupported MSC descriptor table pointer layout: " + shader.desc.debugName);
+                return nullptr;
+            }
+            tables[tableIndices[i]].byteOffset = location.topLevelOffset;
+            metadata.argumentBufferSize = std::max(metadata.argumentBufferSize, location.topLevelOffset + location.sizeBytes);
+        }
+        for (auto& binding : metadata.topLevelArgumentBuffer)
+            binding.tableIndex = uint32_t(std::find(tableIndices.begin(), tableIndices.end(), binding.tableIndex) - tableIndices.begin());
+        for (uint32_t index : tableIndices)
+            metadata.descriptorTables.push_back(tables[index]);
+        metadata.resourceCount = desc.BoundResources;
+        return root.release();
+    }
+
+    static bool convertDxilShader(const MTL3Context& context, Shader& shader, const void* binary, size_t binarySize,
+        std::vector<uint8_t>& metallib, std::string& entryName)
+    {
+        IRShaderStage stage = IRShaderStageInvalid;
+        switch (shader.desc.shaderType)
+        {
+        case ShaderType::Vertex: stage = IRShaderStageVertex; break;
+        case ShaderType::Pixel: stage = IRShaderStageFragment; break;
+        case ShaderType::Compute: stage = IRShaderStageCompute; break;
+        default:
+            context.error("[metal3] DXIL conversion supports vertex, pixel and compute shaders: " + shader.desc.debugName);
+            return false;
+        }
+        std::unique_ptr<IRRootSignature, decltype(&IRRootSignatureDestroy)> root(
+            createDxilRootSignature(context, shader, binary, binarySize), IRRootSignatureDestroy);
+        if (!root)
+            return false;
+
+        std::unique_ptr<IRCompiler, decltype(&IRCompilerDestroy)> compiler(IRCompilerCreate(), IRCompilerDestroy);
+        std::unique_ptr<IRObject, decltype(&IRObjectDestroy)> input(
+            IRObjectCreateFromDXIL(static_cast<const uint8_t*>(binary), binarySize, IRBytecodeOwnershipNone), IRObjectDestroy);
+        if (!compiler || !input)
+        {
+            context.error("[metal3] Unable to initialize DXIL conversion: " + shader.desc.debugName);
+            return false;
+        }
+
+        IRCompilerSetMinimumGPUFamily(compiler.get(), IRGPUFamilyMetal3);
+        IRCompilerSetMinimumDeploymentTarget(compiler.get(), IROperatingSystem_macOS, "14.0.0");
+        IRCompilerSetStageInGenerationMode(compiler.get(), IRStageInCodeGenerationModeUseMetalVertexFetch);
+        IRCompilerSetFunctionConstantResourceSpace(compiler.get(), UINT32_MAX);
+        IRCompilerSetFramebufferFetchResourceSpace(compiler.get(), UINT32_MAX);
+        IRCompilerIgnoreRootSignature(compiler.get(), true);
+        IRCompilerSetGlobalRootSignature(compiler.get(), root.get());
+        IRCompilerSetEntryPointName(compiler.get(), entryName.c_str());
+        IRError* error = nullptr;
+        std::unique_ptr<IRObject, decltype(&IRObjectDestroy)> output(
+            IRCompilerAllocCompileAndLink(compiler.get(), entryName.c_str(), input.get(), &error), IRObjectDestroy);
+        if (!output)
+        {
+            context.error("[metal3] DXIL conversion failed for '" + shader.desc.debugName + "': " + converterErrorDescription(error));
+            if (error)
+                IRErrorDestroy(error);
+            return false;
+        }
+        if (error)
+            IRErrorDestroy(error);
+
+        std::unique_ptr<IRShaderReflection, decltype(&IRShaderReflectionDestroy)> reflection(
+            IRShaderReflectionCreate(), IRShaderReflectionDestroy);
+        std::unique_ptr<IRMetalLibBinary, decltype(&IRMetalLibBinaryDestroy)> library(
+            IRMetalLibBinaryCreate(), IRMetalLibBinaryDestroy);
+        if (!reflection || !library || !IRObjectGetReflection(output.get(), stage, reflection.get()) ||
+            !IRObjectGetMetalLibBinary(output.get(), stage, library.get()))
+        {
+            context.error("[metal3] Missing MSC library or stage reflection: " + shader.desc.debugName);
+            return false;
+        }
+
+        auto& metadata = shader.mscReflection;
+        metadata.needsFunctionConstants = IRShaderReflectionNeedsFunctionConstants(reflection.get());
+        if (metadata.needsFunctionConstants)
+        {
+            context.error("[metal3] Shader requires unsupported MSC function constants: " + shader.desc.debugName);
+            return false;
+        }
+        const char* reflectedEntry = IRShaderReflectionGetEntryPointFunctionName(reflection.get());
+        if (!reflectedEntry || !*reflectedEntry)
+        {
+            context.error("[metal3] Missing MSC entry point: " + shader.desc.debugName);
+            return false;
+        }
+        entryName = reflectedEntry;
+
+        if (stage == IRShaderStageVertex)
+        {
+            IRVersionedVSInfo info{};
+            if (!IRShaderReflectionCopyVertexInfo(reflection.get(), IRReflectionVersion_1_0, &info))
+            {
+                context.error("[metal3] Missing MSC vertex inputs: " + shader.desc.debugName);
+                return false;
+            }
+            metadata.vertexOutputSizeInBytes = info.info_1_0.vertex_output_size_in_bytes;
+            for (size_t i = 0; i < info.info_1_0.num_vertex_inputs; ++i)
+            {
+                const auto& attribute = info.info_1_0.vertex_inputs[i];
+                if (attribute.name)
+                    metadata.vertexInputAttributes[normalizeMscVertexInputName(attribute.name)] = attribute.attributeIndex;
+            }
+            IRShaderReflectionReleaseVertexInfo(&info);
+        }
+        if (stage == IRShaderStageCompute)
+        {
+            IRVersionedCSInfo info{};
+            if (!IRShaderReflectionCopyComputeInfo(reflection.get(), IRReflectionVersion_1_0, &info))
+            {
+                context.error("[metal3] Missing MSC compute dimensions: " + shader.desc.debugName);
+                return false;
+            }
+            shader.computeThreadsPerGroup = MTLSizeMake(info.info_1_0.tg_size[0], info.info_1_0.tg_size[1], info.info_1_0.tg_size[2]);
+            IRShaderReflectionReleaseComputeInfo(&info);
+            shader.computeThreadsPerGroupValid = shader.computeThreadsPerGroup.width != 0 &&
+                shader.computeThreadsPerGroup.height != 0 && shader.computeThreadsPerGroup.depth != 0;
+            if (!shader.computeThreadsPerGroupValid)
+            {
+                context.error("[metal3] Invalid MSC compute dimensions: " + shader.desc.debugName);
+                return false;
+            }
+        }
+        metallib.resize(IRMetalLibGetBytecodeSize(library.get()));
+        if (metallib.empty() || IRMetalLibGetBytecode(library.get(), metallib.data()) != metallib.size())
+        {
+            context.error("[metal3] Failed to extract MSC bytecode: " + shader.desc.debugName);
+            return false;
+        }
+        metadata.valid = true;
+        return true;
+    }
+
     ShaderHandle Device::createShader(const ShaderDesc& d, const void* binary, size_t binarySize)
     {
         if (!binary || binarySize == 0)
@@ -264,6 +606,19 @@ namespace nvrhi::metal3
         Shader* shader = new Shader();
         shader->desc = d;
         shader->bytecode.assign(static_cast<const uint8_t*>(binary), static_cast<const uint8_t*>(binary) + binarySize);
+        const bool isDxil = binarySize >= 4 && std::memcmp(binary, "DXBC", 4) == 0;
+        std::string entryName = d.entryName.empty() ? "main" : d.entryName;
+        std::vector<uint8_t> metallib;
+        if (isDxil)
+        {
+            if (!convertDxilShader(m_Context, *shader, binary, binarySize, metallib, entryName))
+            {
+                delete shader;
+                return nullptr;
+            }
+            binary = metallib.data();
+            binarySize = metallib.size();
+        }
 
         dispatch_data_t data = dispatch_data_create(binary, binarySize, dispatch_get_main_queue(), DISPATCH_DATA_DESTRUCTOR_DEFAULT);
         NSError* error = nil;
@@ -278,7 +633,7 @@ namespace nvrhi::metal3
             return nullptr;
         }
 
-        NSString* entry = [NSString stringWithUTF8String:d.entryName.empty() ? "main" : d.entryName.c_str()];
+        NSString* entry = [NSString stringWithUTF8String:entryName.c_str()];
         shader->function = [shader->library newFunctionWithName:entry];
         if (!shader->function)
         {
@@ -292,7 +647,7 @@ namespace nvrhi::metal3
             return nullptr;
         }
 
-        std::filesystem::path stageInPath = makeMscStageInLibraryPath(d.debugName);
+        std::filesystem::path stageInPath = isDxil ? std::filesystem::path() : makeMscStageInLibraryPath(d.debugName);
         if (!stageInPath.empty() && std::filesystem::exists(stageInPath))
         {
             NSError* stageInError = nil;
@@ -312,7 +667,11 @@ namespace nvrhi::metal3
 
         MTLSize reflectionThreads = MTLSizeMake(0, 0, 0);
         std::string reflectionPath;
-        if (loadMscReflection(d.debugName, shader->mscReflection, &reflectionThreads, reflectionPath))
+        if (isDxil)
+        {
+            reflectionThreads = shader->computeThreadsPerGroupValid ? shader->computeThreadsPerGroup : reflectionThreads;
+        }
+        else if (loadMscReflection(d.debugName, shader->mscReflection, &reflectionThreads, reflectionPath))
         {
             // uncomment for debugging
             // m_Context.info("[metal3] shader '" + d.debugName + "' reflection='" + reflectionPath +

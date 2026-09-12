@@ -566,28 +566,6 @@ namespace nvrhi::metal3
         }
     }
 
-    TimerQueryHandle Device::createTimerQuery()
-    {
-        m_Context.unsupported(__func__);
-        return nullptr;
-    }
-
-    bool Device::pollTimerQuery(ITimerQuery* query)
-    {
-        m_Context.unsupported(__func__);
-        return false;
-    }
-
-    float Device::getTimerQueryTime(ITimerQuery* query)
-    {
-        m_Context.unsupported(__func__);
-        return std::numeric_limits<float>::quiet_NaN();
-    }
-
-    void Device::resetTimerQuery(ITimerQuery* query)
-    {
-        m_Context.unsupported(__func__);
-    }
 
     MeshletPipelineHandle Device::createMeshletPipeline(const MeshletPipelineDesc& desc, FramebufferInfo const& fbinfo)
     {
@@ -605,35 +583,6 @@ namespace nvrhi::metal3
         return nullptr;
     }
 
-    BindingLayoutHandle Device::createBindlessLayout(const BindlessLayoutDesc& desc)
-    {
-        (void)desc;
-        m_Context.unsupported(__func__);
-        return nullptr;
-    }
-
-    DescriptorTableHandle Device::createDescriptorTable(IBindingLayout* layout)
-    {
-        (void)layout;
-        m_Context.unsupported(__func__);
-        return nullptr;
-    }
-
-    void Device::resizeDescriptorTable(IDescriptorTable* descriptorTable, uint32_t newSize, bool keepContents)
-    {
-        (void)descriptorTable;
-        (void)newSize;
-        (void)keepContents;
-        m_Context.unsupported(__func__);
-    }
-
-    bool Device::writeDescriptorTable(IDescriptorTable* descriptorTable, const BindingSetItem& item)
-    {
-        (void)descriptorTable;
-        (void)item;
-        m_Context.unsupported(__func__);
-        return false;
-    }
 
     rt::OpacityMicromapHandle Device::createOpacityMicromap(const rt::OpacityMicromapDesc& desc)
     {
