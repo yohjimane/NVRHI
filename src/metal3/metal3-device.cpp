@@ -553,6 +553,14 @@ namespace nvrhi::metal3
             return MTLPixelFormatBC5_RGUnorm;
         case Format::BC5_SNORM:
             return MTLPixelFormatBC5_RGSnorm;
+        case Format::BC6H_UFLOAT:
+            return MTLPixelFormatBC6H_RGBUfloat;
+        case Format::BC6H_SFLOAT:
+            return MTLPixelFormatBC6H_RGBFloat;
+        case Format::BC7_UNORM:
+            return MTLPixelFormatBC7_RGBAUnorm;
+        case Format::BC7_UNORM_SRGB:
+            return MTLPixelFormatBC7_RGBAUnorm_sRGB;
         case Format::D32:
             return MTLPixelFormatDepth32Float;
         case Format::D16:
