@@ -41,6 +41,9 @@ option(NVRHI_WITH_AFTERMATH "Include Aftermath support (requires NSight Aftermat
 cmake_dependent_option(NVRHI_WITH_NVAPI "Include NVAPI support (requires NVAPI SDK)" OFF "WIN32" OFF)
 cmake_dependent_option(NVRHI_WITH_DX11 "Build the NVRHI D3D11 backend" ON "WIN32" OFF)
 cmake_dependent_option(NVRHI_WITH_DX12 "Build the NVRHI D3D12 backend" ON "WIN32" OFF)
+cmake_dependent_option(NVRHI_WITH_METAL3 "Build the NVRHI Metal 3 backend" ON "APPLE" OFF)
+cmake_dependent_option(NVRHI_METAL3_WITH_TRACY "Enable Tracy GPU timestamp instrumentation in the Metal 3 backend" OFF "NVRHI_WITH_METAL3" OFF)
+
 
 if(NVRHI_WITH_VULKAN)
     option(NVRHI_FETCH_VULKAN_HEADERS "Fetch Vulkan-Headers when building the Vulkan backend and no external targets are provided" ON)
@@ -57,6 +60,9 @@ if(NVRHI_WITH_DX12)
     set(NVRHI_DIRECTX_HEADERS_FETCH_DIR "" CACHE STRING "Source directory for fetched DirectX-Headers; empty uses CMake FetchContent default")
 endif()
 
+if(NVRHI_WITH_METAL3)
+    enable_language(OBJCXX)
+endif()
 if(NVRHI_WITH_RTXMU)
     set(NVRHI_RTXMU_GIT_REPOSITORY "https://github.com/NVIDIA-RTX/RTXMU.git" CACHE STRING "RTXMU git repository")
     set(NVRHI_RTXMU_GIT_TAG "v1.4" CACHE STRING "RTXMU git tag or commit")
@@ -171,7 +177,7 @@ endif()
 
 if (NVRHI_WITH_RTXMU)
     get_target_property(RTXMU_VULKAN_INCLUDE_DIR ${nvrhi_vulkan_headers_target} INTERFACE_INCLUDE_DIRECTORIES)
-    
+
     option(RTXMU_WITH_VULKAN "" ${NVRHI_WITH_VULKAN})
     option(RTXMU_WITH_D3D12 "" ${NVRHI_WITH_DX12})
 
@@ -299,6 +305,25 @@ set(src_vk
     src/vulkan/vulkan-texture.cpp
     src/vulkan/vulkan-upload.cpp
     src/vulkan/vulkan-backend.h)
+
+set(include_metal3
+    include/nvrhi/metal3.h)
+set(src_metal3_impl
+    src/metal3/metal3-buffer.cpp
+    src/metal3/metal3-commandlist.cpp
+    src/metal3/metal3-compute.cpp
+    src/metal3/metal3-constants.cpp
+    src/metal3/metal3-device.cpp
+    src/metal3/metal3-graphics.cpp
+    src/metal3/metal3-queries.cpp
+    src/metal3/metal3-raytracing.cpp
+    src/metal3/metal3-resource-bindings.cpp
+    src/metal3/metal3-shader.cpp
+    src/metal3/metal3-state-tracking.cpp
+    src/metal3/metal3-texture.cpp)
+set(src_metal3
+    src/metal3/metal3-backend.h
+    ${src_metal3_impl})
 
 # NVRHI interface and common implementation functions
 
@@ -444,6 +469,55 @@ if (NVRHI_WITH_VULKAN)
     target_compile_definitions(${nvrhi_vulkan_target} PRIVATE NVRHI_WITH_AFTERMATH=$<BOOL:${NVRHI_WITH_AFTERMATH}>)
 endif()
 
+if (NVRHI_WITH_METAL3)
+    if (NVRHI_BUILD_SHARED)
+        set(nvrhi_metal3_target nvrhi)
+
+        target_sources(${nvrhi_metal3_target} PRIVATE
+            ${include_metal3}
+            ${src_metal3})
+    else()
+        set(nvrhi_metal3_target nvrhi_metal3)
+
+        add_library(${nvrhi_metal3_target} STATIC
+            ${include_metal3}
+            ${src_metal3})
+
+        set_target_properties(${nvrhi_metal3_target} PROPERTIES FOLDER "NVRHI")
+        target_include_directories(${nvrhi_metal3_target} PRIVATE include)
+    endif()
+
+    find_library(NVRHI_METAL_FRAMEWORK Metal REQUIRED)
+    find_library(NVRHI_FOUNDATION_FRAMEWORK Foundation REQUIRED)
+    find_library(NVRHI_QUARTZCORE_FRAMEWORK QuartzCore REQUIRED)
+    find_path(NVRHI_METAL_IRCONVERTER_RUNTIME_INCLUDE_DIR
+        NAMES metal_irconverter_runtime/metal_irconverter_runtime.h
+        PATHS
+            /usr/local/include
+            /opt/homebrew/include
+        REQUIRED)
+
+    set_source_files_properties(${src_metal3_impl} PROPERTIES LANGUAGE OBJCXX)
+    target_compile_features(${nvrhi_metal3_target} PRIVATE cxx_std_17)
+    target_compile_options(${nvrhi_metal3_target} PRIVATE "$<$<COMPILE_LANGUAGE:OBJCXX>:-fobjc-arc>")
+    target_include_directories(${nvrhi_metal3_target}
+        PRIVATE
+            ${NVRHI_METAL_IRCONVERTER_RUNTIME_INCLUDE_DIR})
+    target_link_libraries(${nvrhi_metal3_target}
+        PUBLIC
+            ${NVRHI_METAL_FRAMEWORK}
+            ${NVRHI_FOUNDATION_FRAMEWORK}
+            ${NVRHI_QUARTZCORE_FRAMEWORK})
+
+    if (NVRHI_METAL3_WITH_TRACY)
+        if (NOT TARGET Tracy::TracyClient)
+            message(FATAL_ERROR "NVRHI_METAL3_WITH_TRACY requires the Tracy::TracyClient target")
+        endif()
+        target_link_libraries(${nvrhi_metal3_target} PRIVATE Tracy::TracyClient)
+        target_compile_definitions(${nvrhi_metal3_target} PRIVATE NVRHI_METAL3_WITH_TRACY=1)
+    endif()
+endif()
+
 
 if (NVRHI_INSTALL)
     install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/include/nvrhi
@@ -466,6 +540,10 @@ if (NVRHI_INSTALL)
 
         if (NVRHI_WITH_VULKAN)
             install(TARGETS ${nvrhi_vulkan_target} DESTINATION "lib" EXPORT "nvrhiTargets")
+        endif()
+
+        if (NVRHI_WITH_METAL3)
+            install(TARGETS ${nvrhi_metal3_target} DESTINATION "lib" EXPORT "nvrhiTargets")
         endif()
     endif()
 

@@ -155,7 +155,8 @@ namespace nvrhi
     {
         D3D11,
         D3D12,
-        VULKAN
+        VULKAN,
+        METAL3
     };
 
     enum class Format : uint8_t

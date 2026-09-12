@@ -87,6 +87,11 @@ namespace nvrhi
         constexpr ObjectType VK_Pipeline                            = 0x00030013;
         constexpr ObjectType VK_Micromap                            = 0x00030014;
         constexpr ObjectType VK_ImageCreateInfo                     = 0x00030015;
+
+        // metal 3
+        constexpr ObjectType MTL3_Device                            = 0x00040001;
+        constexpr ObjectType MTL3_CommandQueue                      = 0x00040002;
+        constexpr ObjectType MTL3_Texture                           = 0x00040003;
     };
 
     struct Object
