@@ -70,14 +70,14 @@ namespace nvrhi::vulkan
         {
             shaderStages.push_back(makeShaderStageCreateInfo(AS, 
                 specInfos, specMapEntries, specData));
-            pso->shaderMask = pso->shaderMask | ShaderType::Vertex;
+            pso->shaderMask = pso->shaderMask | ShaderType::Amplification;
         }
 
         if (desc.MS)
         {
             shaderStages.push_back(makeShaderStageCreateInfo(MS, 
                 specInfos, specMapEntries, specData));
-            pso->shaderMask = pso->shaderMask | ShaderType::Hull;
+            pso->shaderMask = pso->shaderMask | ShaderType::Mesh;
         }
         
         if (desc.PS)
@@ -277,7 +277,7 @@ namespace nvrhi::vulkan
         m_CurrentPipelineLayout = pso->pipelineLayout;
         m_CurrentPushConstantsVisibility = pso->pushConstantVisibility;
 
-        if (arraysAreDifferent(m_CurrentComputeState.bindings, state.bindings) || m_AnyVolatileBufferWrites)
+        if (updatePipeline || arraysAreDifferent(m_CurrentMeshletState.bindings, state.bindings) || m_AnyVolatileBufferWrites)
         {
             bindBindingSets(vk::PipelineBindPoint::eGraphics, pso->pipelineLayout, state.bindings, pso->descriptorSetIdxToBindingIdx);
         }
