@@ -1,5 +1,7 @@
 #include <nvrhi/metal3.h>
 #include <nvrhi/common/resource.h>
+#include <atomic>
+#include <thread>
 #include <cstdio>
 #include <stdexcept>
 
@@ -13,7 +15,7 @@ namespace
 
     struct Messages final : nvrhi::IMessageCallback
     {
-        unsigned errors = 0;
+        std::atomic<unsigned> errors{0};
         void message(nvrhi::MessageSeverity severity, const char* text) override
         {
             std::fprintf(stderr, "%s\n", text);
@@ -231,6 +233,174 @@ namespace
         ~Gate() { event.signaledValue = 1; }
     };
 
+    void eventRearm()
+    {
+        Fixture f;
+        Gate firstGate(f.desc.pDevice);
+        Gate secondGate(f.desc.pDevice);
+        auto query = f.device->createEventQuery();
+        id<MTLCommandBuffer> firstBlocker = [f.desc.commonQueue commandBuffer];
+        [firstBlocker encodeWaitForEvent:firstGate.event value:1];
+        [firstBlocker commit];
+        f.device->setEventQuery(query, nvrhi::CommandQueue::Graphics);
+        require(!f.device->pollEventQuery(query), "Event completed before blocked GPU work");
+        id<MTLCommandBuffer> boundary = [f.desc.commonQueue commandBuffer];
+        [boundary commit];
+        id<MTLCommandBuffer> secondBlocker = [f.desc.commonQueue commandBuffer];
+        [secondBlocker encodeWaitForEvent:secondGate.event value:1];
+        [secondBlocker commit];
+        f.device->resetEventQuery(query);
+        f.device->setEventQuery(query, nvrhi::CommandQueue::Graphics);
+        firstGate.event.signaledValue = 1;
+        [boundary waitUntilCompleted];
+        require(!f.device->pollEventQuery(query), "An old completion signaled a rearmed event query");
+        secondGate.event.signaledValue = 1;
+        f.device->waitEventQuery(query);
+        require(f.device->pollEventQuery(query), "Completed event did not become observable");
+        f.checkErrors();
+    }
+
+    void queueDependencies()
+    {
+        Fixture f;
+        Gate gate(f.desc.pDevice);
+        id<MTLCommandBuffer> blocker = [f.desc.commonQueue commandBuffer];
+        [blocker encodeWaitForEvent:gate.event value:1];
+        [blocker commit];
+        auto producer = f.list(false, nvrhi::CommandQueue::Copy);
+        f.record(producer, 0x98765432u);
+        const uint64_t copyID = f.execute(producer, nvrhi::CommandQueue::Copy);
+        f.expectError([&] { f.device->queueWaitForCommandList(nvrhi::CommandQueue::Compute, nvrhi::CommandQueue::Graphics, copyID); });
+        f.device->queueWaitForCommandList(nvrhi::CommandQueue::Compute, nvrhi::CommandQueue::Copy, copyID);
+        auto compute = f.list(false, nvrhi::CommandQueue::Compute);
+        compute->open();
+        compute->copyBuffer(f.buffer, 4, f.buffer, 0, 4);
+        compute->close();
+        const uint64_t computeID = f.execute(compute, nvrhi::CommandQueue::Compute);
+        f.device->queueWaitForCommandList(nvrhi::CommandQueue::Graphics, nvrhi::CommandQueue::Compute, computeID);
+        auto graphics = f.list();
+        graphics->open();
+        graphics->copyBuffer(f.buffer, 8, f.buffer, 4, 4);
+        graphics->close();
+        f.execute(graphics);
+        auto query = f.device->createEventQuery();
+        f.device->setEventQuery(query, nvrhi::CommandQueue::Graphics);
+        f.device->runGarbageCollection();
+        require(!f.device->pollEventQuery(query), "Queue chain completed while its producer was blocked");
+        gate.event.signaledValue = 1;
+        f.device->waitEventQuery(query);
+        require(f.device->pollEventQuery(query), "Queue chain completion was not observed");
+        require(f.words[2] == 0x98765432u, "Cross-queue consumer missed its producer's write");
+        f.device->runGarbageCollection();
+        f.device->queueWaitForCommandList(nvrhi::CommandQueue::Graphics, nvrhi::CommandQueue::Copy, copyID);
+        f.device->queueWaitForCommandList(nvrhi::CommandQueue::Copy, nvrhi::CommandQueue::Graphics, 0);
+        f.expectError([&] { f.device->queueWaitForCommandList(nvrhi::CommandQueue::Compute, nvrhi::CommandQueue::Copy, copyID + 1); });
+        f.expectError([&] { f.device->queueWaitForCommandList(nvrhi::CommandQueue::Count, nvrhi::CommandQueue::Copy, copyID); });
+        require(f.device->waitForIdle(), "Successful queue chain reported an idle failure");
+        f.checkErrors();
+    }
+
+    void simultaneousWaiters()
+    {
+        Fixture f;
+        Gate gate(f.desc.pDevice);
+        id<MTLCommandBuffer> blocker = [f.desc.commonQueue commandBuffer];
+        [blocker encodeWaitForEvent:gate.event value:1];
+        [blocker commit];
+        auto query = f.device->createEventQuery();
+        f.device->setEventQuery(query, nvrhi::CommandQueue::Graphics);
+        std::atomic<unsigned> entered{0};
+        std::atomic<unsigned> finished{0};
+        std::atomic<bool> idleSucceeded{false};
+        auto wait = [&] {
+            @autoreleasepool
+            {
+                ++entered;
+                f.device->waitEventQuery(query);
+                ++finished;
+            }
+        };
+        std::thread first(wait);
+        std::thread second(wait);
+        std::thread idle([&] {
+            @autoreleasepool
+            {
+                ++entered;
+                idleSucceeded = f.device->waitForIdle();
+                ++finished;
+            }
+        });
+        while (entered.load() != 3)
+            std::this_thread::yield();
+        f.device->runGarbageCollection();
+        const bool stayedPending = finished.load() == 0 && !f.device->pollEventQuery(query);
+        gate.event.signaledValue = 1;
+        first.join();
+        second.join();
+        idle.join();
+        require(stayedPending, "A wait returned before GPU completion");
+        require(finished == 3 && idleSucceeded, "Concurrent waiters did not all observe completion");
+        f.checkErrors();
+    }
+
+    void lifetimeTrackers()
+    {
+        Fixture f;
+        Gate gate(f.desc.pDevice);
+        id<MTLCommandBuffer> blocker = [f.desc.commonQueue commandBuffer];
+        [blocker encodeWaitForEvent:gate.event value:1];
+        [blocker commit];
+        auto tracker = f.device->createCommandListLifetimeTracker(nvrhi::CommandQueue::Graphics);
+        require(tracker != nullptr, "Native lifetime tracker unavailable");
+        nvrhi::CommandListParameters params;
+        params.enableImmediateExecution = false;
+        params.lifetimeTracker = tracker;
+        auto commands = f.device->createCommandList(params);
+        require(commands != nullptr, "Native lifetime tracker was rejected");
+        for (unsigned index = 0; index < 8; ++index)
+        {
+            f.record(commands, 0x23450000u + index, index);
+            f.execute(commands);
+            tracker->runGarbageCollection();
+        }
+        auto query = f.device->createEventQuery();
+        f.device->setEventQuery(query, nvrhi::CommandQueue::Graphics);
+        tracker = nullptr;
+        params.lifetimeTracker = nullptr;
+        commands = nullptr;
+        f.device->runGarbageCollection();
+        require(!f.device->pollEventQuery(query), "Tracker destruction manufactured GPU completion");
+        gate.event.signaledValue = 1;
+        f.device->waitEventQuery(query);
+        for (unsigned index = 0; index < 8; ++index)
+            require(f.words[index] == 0x23450000u + index, "Tracker disposal corrupted in-flight work");
+        f.device->runGarbageCollection();
+
+        tracker = f.device->createCommandListLifetimeTracker(nvrhi::CommandQueue::Copy);
+        params.queueType = nvrhi::CommandQueue::Copy;
+        params.lifetimeTracker = tracker;
+        commands = f.device->createCommandList(params);
+        require(commands != nullptr, "Copy-queue lifetime tracker rejected");
+        f.record(commands, 0xabcdef12u);
+        f.execute(commands, nvrhi::CommandQueue::Copy);
+        f.device->setEventQuery(query, nvrhi::CommandQueue::Copy);
+        f.device->waitEventQuery(query);
+        commands = nullptr;
+        tracker->runGarbageCollection();
+        require(f.words[0] == 0xabcdef12u, "Custom tracker collection lost submitted work");
+        params.queueType = nvrhi::CommandQueue::Graphics;
+        f.expectError([&] { require(f.device->createCommandList(params) == nullptr, "Wrong-queue lifetime tracker accepted"); });
+        auto otherDesc = f.desc;
+        otherDesc.commonQueue = [f.desc.pDevice newCommandQueue];
+        auto other = nvrhi::metal3::createDevice(otherDesc);
+        params.queueType = nvrhi::CommandQueue::Copy;
+        f.expectError([&] { require(other->createCommandList(params) == nullptr, "Foreign-device lifetime tracker accepted"); });
+        f.expectError([&] { require(f.device->createCommandListLifetimeTracker(nvrhi::CommandQueue::Count) == nullptr, "Invalid tracker queue accepted"); });
+        f.expectError([&] { require(!other->pollEventQuery(query), "Foreign-device event query accepted"); });
+        f.expectError([&] { f.device->setEventQuery(query, nvrhi::CommandQueue::Count); });
+        f.checkErrors();
+    }
+
     void inFlightReuse()
     {
         Fixture f;
@@ -266,7 +436,11 @@ int main()
             immediateRules();
             discardedRecording();
             inFlightReuse();
-            std::puts("PASS: deferred ordering, atomic batch rejection, queue/device ownership, immediate rules, discard, and in-flight reuse");
+            eventRearm();
+            queueDependencies();
+            simultaneousWaiters();
+            lifetimeTrackers();
+            std::puts("PASS: submission, event rearm, queue dependencies, concurrent waits, and lifetime tracking");
             return 0;
         }
         catch (const std::exception& error)

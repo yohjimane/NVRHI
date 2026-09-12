@@ -46,9 +46,15 @@ namespace nvrhi::metal3
 
         // queues, resoureces reserve, allocation, etc...
         m_Context.commonQueue = desc.commonQueue;
+        for (uint32_t index = 0; index < uint32_t(CommandQueue::Count); ++index)
+            m_DefaultLifetimeTrackers[index] = RefCountPtr<CommandListLifetimeTracker>::Create(
+                new CommandListLifetimeTracker(this, CommandQueue(index), true));
     }
 
-    Device::~Device() = default;
+    Device::~Device()
+    {
+        waitForIdle();
+    }
 
     Object Device::getNativeObject(ObjectType objectType)
     {
@@ -67,25 +73,117 @@ namespace nvrhi::metal3
     {
         return GraphicsAPI::METAL3;
     }
-    // placeholders
     Object Device::getNativeQueue(ObjectType objectType, CommandQueue queue)
     {
-        (void)queue;
-        if (objectType == ObjectTypes::MTL3_CommandQueue)
+        if (objectType == ObjectTypes::MTL3_CommandQueue && uint32_t(queue) < uint32_t(CommandQueue::Count))
             return Object((__bridge void*)m_Context.commonQueue);
         return nullptr;
     }
 
     bool Device::waitForIdle()
     {
-        id<MTLCommandBuffer> commandBuffer = [m_Context.commonQueue commandBuffer];
-        [commandBuffer commit];
+        id<MTLCommandBuffer> commandBuffer;
+        {
+            std::lock_guard<std::mutex> lock(m_Mutex);
+            commandBuffer = [m_Context.commonQueue commandBuffer];
+            if (!commandBuffer)
+            {
+                m_Context.error("[nvrhi] Failed to allocate a Metal idle marker.");
+                return false;
+            }
+            [commandBuffer commit];
+        }
         [commandBuffer waitUntilCompleted];
+        std::lock_guard<std::mutex> lock(m_Mutex);
+        updateCompletedSubmissions();
+        bool success = commandBuffer.status == MTLCommandBufferStatusCompleted;
+        for (uint32_t index = 0; index < uint32_t(CommandQueue::Count); ++index)
+        {
+            success = success && m_Queues[index].firstFailure == 0;
+            m_DefaultLifetimeTrackers[index]->collect();
+        }
+        if (!success)
+            m_Context.error("[nvrhi] Metal queue idle wait detected failed GPU work.");
+        return success;
+    }
+
+    void Device::updateCompletedSubmissions()
+    {
+        for (QueueState& queue : m_Queues)
+        {
+            while (!queue.pending.empty())
+            {
+                const SubmittedCommandBuffer& submitted = queue.pending.front();
+                const MTLCommandBufferStatus status = submitted.commandBuffer.status;
+                if (status != MTLCommandBufferStatusCompleted && status != MTLCommandBufferStatusError)
+                    break;
+                if (status == MTLCommandBufferStatusError && queue.firstFailure == 0)
+                {
+                    queue.firstFailure = submitted.instance;
+                    const char* message = submitted.commandBuffer.error.localizedDescription.UTF8String;
+                    m_Context.error(std::string("[nvrhi] Metal GPU submission failed: ") + (message ? message : "unknown error"));
+                }
+                if (submitted.lastInBatch)
+                    queue.completed = submitted.instance;
+                queue.pending.pop_front();
+            }
+        }
+    }
+
+    bool Device::submissionsSucceeded(const std::array<uint64_t, uint32_t(CommandQueue::Count)>& submissions) const
+    {
+        for (uint32_t index = 0; index < uint32_t(CommandQueue::Count); ++index)
+        {
+            const QueueState& queue = m_Queues[index];
+            if (queue.completed < submissions[index]
+                || (queue.firstFailure != 0 && queue.firstFailure <= submissions[index]))
+                return false;
+        }
         return true;
     }
 
     void Device::runGarbageCollection()
     {
+        std::lock_guard<std::mutex> lock(m_Mutex);
+        updateCompletedSubmissions();
+        for (const auto& tracker : m_DefaultLifetimeTrackers)
+            tracker->collect();
+    }
+
+    CommandListLifetimeTracker::CommandListLifetimeTracker(Device* device, CommandQueue queue, bool isDefault)
+        : m_Device(device), m_Queue(queue), m_IsDefault(isDefault)
+    {
+    }
+
+    CommandListLifetimeTracker::~CommandListLifetimeTracker()
+    {
+        if (m_IsDefault || m_CommandBuffers.empty())
+            return;
+        std::lock_guard<std::mutex> lock(m_Device->m_Mutex);
+        auto& retained = m_Device->m_DefaultLifetimeTrackers[uint32_t(m_Queue)]->m_CommandBuffers;
+        for (auto& commandBuffer : m_CommandBuffers)
+            retained.push_back(std::move(commandBuffer));
+    }
+
+    Object CommandListLifetimeTracker::getNativeObject(ObjectType objectType)
+    {
+        return objectType == ObjectTypes::Nvrhi_Metal3_LifetimeTracker ? Object(this) : Object(nullptr);
+    }
+
+    void CommandListLifetimeTracker::collect()
+    {
+        auto end = std::remove_if(m_CommandBuffers.begin(), m_CommandBuffers.end(), [](const TrackedCommandBuffer& tracked) {
+            const MTLCommandBufferStatus status = tracked.commandBuffer.status;
+            return status == MTLCommandBufferStatusCompleted || status == MTLCommandBufferStatusError;
+        });
+        m_CommandBuffers.erase(end, m_CommandBuffers.end());
+    }
+
+    void CommandListLifetimeTracker::runGarbageCollection()
+    {
+        std::lock_guard<std::mutex> lock(m_Device->m_Mutex);
+        m_Device->updateCompletedSubmissions();
+        collect();
     }
 
     HeapHandle Device::createHeap(const HeapDesc& d)
@@ -276,61 +374,90 @@ namespace nvrhi::metal3
     }
     EventQueryHandle Device::createEventQuery()
     {
-        return EventQueryHandle::Create(new EventQuery());
+        return EventQueryHandle::Create(new EventQuery(this));
+    }
+
+    EventQuery* Device::getEventQuery(IEventQuery* query)
+    {
+        auto* event = query ? static_cast<EventQuery*>(query->getNativeObject(ObjectTypes::Nvrhi_Metal3_EventQuery).pointer) : nullptr;
+        if (!event || event->device != this)
+        {
+            m_Context.error("[nvrhi] Metal event query belongs to a different device or backend.");
+            return nullptr;
+        }
+        return event;
     }
 
     void Device::setEventQuery(IEventQuery* query, CommandQueue queue)
     {
-        (void)queue;
-
-        EventQuery* event = static_cast<EventQuery*>(query);
-        if (!event || !event->semaphore || !m_Context.commonQueue)
+        std::lock_guard<std::mutex> lock(m_Mutex);
+        if (uint32_t(queue) >= uint32_t(CommandQueue::Count))
+        {
+            m_Context.error("[nvrhi] Invalid Metal event-query queue.");
             return;
-
-        event->signaled.store(false, std::memory_order_release);
-
-        event->AddRef();
-
-        // The renderer uses event queries as per-frame fences. Put a marker
-        // command buffer after the already-submitted frame work on the same
-        // Metal queue; when this marker completes, all earlier frame commands
-        // are complete too and the frame slot can be reused.
-
+        }
+        EventQuery* event = getEventQuery(query);
+        if (!event)
+            return;
         id<MTLCommandBuffer> commandBuffer = [m_Context.commonQueue commandBuffer];
-        [commandBuffer addCompletedHandler:^(id<MTLCommandBuffer>) {
-            event->signaled.store(true, std::memory_order_release);
-            dispatch_semaphore_signal(event->semaphore);
-            event->Release();
-        }];
+        if (!commandBuffer)
+        {
+            m_Context.error("[nvrhi] Failed to allocate a Metal event marker.");
+            return;
+        }
+        event->commandBuffer = commandBuffer;
+        event->failureReported = false;
+        for (uint32_t index = 0; index < uint32_t(CommandQueue::Count); ++index)
+            event->submissions[index] = m_Queues[index].submitted;
         [commandBuffer commit];
     }
 
     bool Device::pollEventQuery(IEventQuery* query)
     {
-        EventQuery* event = static_cast<EventQuery*>(query);
-        return event && event->signaled.load(std::memory_order_acquire);
+        std::lock_guard<std::mutex> lock(m_Mutex);
+        EventQuery* event = getEventQuery(query);
+        if (!event)
+            return false;
+        if (!event->commandBuffer)
+            return true;
+        updateCompletedSubmissions();
+        if (event->commandBuffer.status == MTLCommandBufferStatusError && !event->failureReported)
+        {
+            event->failureReported = true;
+            m_Context.error("[nvrhi] Metal event marker failed.");
+        }
+        return event->commandBuffer.status == MTLCommandBufferStatusCompleted
+            && submissionsSucceeded(event->submissions);
     }
 
     void Device::waitEventQuery(IEventQuery* query)
     {
-        EventQuery* event = static_cast<EventQuery*>(query);
-        if (!event || !event->semaphore)
-            return;
-
-        if (!event->signaled.load(std::memory_order_acquire))
-            dispatch_semaphore_wait(event->semaphore, DISPATCH_TIME_FOREVER);
-
-        event->signaled.store(true, std::memory_order_release);
+        id<MTLCommandBuffer> commandBuffer;
+        std::array<uint64_t, uint32_t(CommandQueue::Count)> submissions;
+        {
+            std::lock_guard<std::mutex> lock(m_Mutex);
+            EventQuery* event = getEventQuery(query);
+            if (!event || !event->commandBuffer)
+                return;
+            commandBuffer = event->commandBuffer;
+            submissions = event->submissions;
+        }
+        [commandBuffer waitUntilCompleted];
+        std::lock_guard<std::mutex> lock(m_Mutex);
+        updateCompletedSubmissions();
+        if (commandBuffer.status != MTLCommandBufferStatusCompleted || !submissionsSucceeded(submissions))
+            m_Context.error("[nvrhi] Metal event wait detected failed GPU work.");
     }
 
     void Device::resetEventQuery(IEventQuery* query)
     {
-        EventQuery* event = static_cast<EventQuery*>(query);
-        if (!event || !event->semaphore)
+        std::lock_guard<std::mutex> lock(m_Mutex);
+        EventQuery* event = getEventQuery(query);
+        if (!event)
             return;
-
-        while (dispatch_semaphore_wait(event->semaphore, DISPATCH_TIME_NOW) == 0) {}
-        event->signaled.store(false, std::memory_order_release);
+        event->commandBuffer = nil;
+        event->submissions.fill(0);
+        event->failureReported = false;
     }
 
     bool Device::queryFeatureSupport(Feature feature, void* pInfo, size_t infoSize)
@@ -520,8 +647,13 @@ namespace nvrhi::metal3
         }
         if (params.lifetimeTracker)
         {
-            m_Context.error("[nvrhi] External Metal command-list lifetime trackers are not supported.");
-            return nullptr;
+            auto* tracker = static_cast<CommandListLifetimeTracker*>(
+                params.lifetimeTracker->getNativeObject(ObjectTypes::Nvrhi_Metal3_LifetimeTracker).pointer);
+            if (!tracker || tracker->m_Device != this || tracker->m_Queue != params.queueType)
+            {
+                m_Context.error("[nvrhi] Metal lifetime tracker belongs to a different device, queue, or backend.");
+                return nullptr;
+            }
         }
         return nvrhi::CommandListHandle::Create(new CommandList(this, m_Context, params));
     }
@@ -563,26 +695,43 @@ namespace nvrhi::metal3
             return 0;
         }
 
+        QueueState& queue = m_Queues[uint32_t(executionQueue)];
+        const uint64_t instance = ++queue.submitted;
         for (size_t index = 0; index < numCommandLists; ++index)
         {
             auto* commandList = static_cast<CommandList*>(
                 pCommandLists[index]->getNativeObject(ObjectTypes::Nvrhi_Metal3_CommandList).pointer);
+            queue.pending.push_back({commandList->trackedCmdBuffer, instance, index + 1 == numCommandLists});
             commandList->submit();
         }
-        return ++m_SubmissionSerial;
+        return instance;
     }
 
     void Device::queueWaitForCommandList(CommandQueue waitQueue, CommandQueue executionQueue, uint64_t instance)
     {
-        (void)waitQueue;
-        (void)executionQueue;
-        (void)instance;
+        std::lock_guard<std::mutex> lock(m_Mutex);
+        if (uint32_t(waitQueue) >= uint32_t(CommandQueue::Count)
+            || uint32_t(executionQueue) >= uint32_t(CommandQueue::Count))
+        {
+            m_Context.error("[nvrhi] Invalid Metal dependency queue.");
+            return;
+        }
+        updateCompletedSubmissions();
+        const QueueState& producer = m_Queues[uint32_t(executionQueue)];
+        if (instance > producer.submitted)
+            m_Context.error("[nvrhi] Metal queue dependency references an unsubmitted execution identifier.");
+        else if (producer.firstFailure != 0 && producer.firstFailure <= instance)
+            m_Context.error("[nvrhi] Metal queue dependency references failed GPU work.");
     }
 
     CommandListLifetimeTrackerHandle Device::createCommandListLifetimeTracker(CommandQueue executionQueue)
     {
-        (void)executionQueue;
-        return nullptr;
+        if (uint32_t(executionQueue) >= uint32_t(CommandQueue::Count))
+        {
+            m_Context.error("[nvrhi] Invalid Metal lifetime-tracker queue.");
+            return nullptr;
+        }
+        return CommandListLifetimeTrackerHandle::Create(new CommandListLifetimeTracker(this, executionQueue));
     }
 
     FormatSupport Device::queryFormatSupport(Format format)

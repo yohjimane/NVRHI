@@ -15,6 +15,8 @@ namespace nvrhi
     {
         constexpr ObjectType Nvrhi_Metal3_Device      = 0x00040101;
         constexpr ObjectType Nvrhi_Metal3_CommandList = 0x00040102;
+        constexpr ObjectType Nvrhi_Metal3_EventQuery = 0x00040103;
+        constexpr ObjectType Nvrhi_Metal3_LifetimeTracker = 0x00040104;
         constexpr ObjectType MTL3_Buffer              = 0x00040004;
         constexpr ObjectType MTL3_Sampler             = 0x00040005;
         constexpr ObjectType MTL3_RenderPipeline      = 0x00040006;

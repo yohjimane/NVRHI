@@ -10,6 +10,7 @@
 #include <dispatch/dispatch.h>
 #include <array>
 #include <atomic>
+#include <deque>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -25,6 +26,8 @@ struct IRDescriptorTableEntry;
 
 namespace nvrhi::metal3 
 {
+    class Device;
+    class CommandListLifetimeTracker;
     class Texture;
     class Buffer;
     class Shader;
@@ -462,11 +465,44 @@ namespace nvrhi::metal3
         IBindingLayout* getLayout() const override { return layout; }
     };
 
+    struct TrackedCommandBuffer
+    {
+        id<MTLCommandBuffer> commandBuffer = nil;
+        std::vector<BindingSetHandle> bindingSets;
+        std::vector<id<MTLBuffer>> buffers;
+        std::vector<id<MTLResource>> resources;
+    };
+
+    class CommandListLifetimeTracker : public RefCounter<ICommandListLifetimeTracker>
+    {
+    public:
+        CommandListLifetimeTracker(Device* device, CommandQueue queue, bool isDefault = false);
+        ~CommandListLifetimeTracker() override;
+        Object getNativeObject(ObjectType objectType) override;
+        void runGarbageCollection() override;
+
+    private:
+        friend class Device;
+        friend class CommandList;
+        void collect();
+        Device* m_Device;
+        CommandQueue m_Queue;
+        bool m_IsDefault;
+        std::deque<TrackedCommandBuffer> m_CommandBuffers;
+    };
+
     class EventQuery : public RefCounter<IEventQuery>
     {
     public:
-        dispatch_semaphore_t semaphore = dispatch_semaphore_create(0);
-        std::atomic<bool> signaled{ true };
+        explicit EventQuery(Device* owner) : device(owner) {}
+        Object getNativeObject(ObjectType objectType) override
+        {
+            return objectType == ObjectTypes::Nvrhi_Metal3_EventQuery ? Object(this) : Object(nullptr);
+        }
+        Device* device;
+        id<MTLCommandBuffer> commandBuffer = nil;
+        std::array<uint64_t, uint32_t(CommandQueue::Count)> submissions{};
+        bool failureReported = false;
     };
     // TODO: stubs
     class TimerQuery : public RefCounter<ITimerQuery> { public: bool resolved = true; float time = 0.f; };
@@ -661,6 +697,7 @@ namespace nvrhi::metal3
         const MTL3Context& m_Context;
 
         Device* m_Device;
+        RefCountPtr<CommandListLifetimeTracker> m_LifetimeTracker;
         
         // i can prolly have Queue struct and pointer to object here
         // but its not really needed, and neither does metal 3 demand it.
@@ -857,7 +894,6 @@ namespace nvrhi::metal3
 
         CommandListLifetimeTrackerHandle createCommandListLifetimeTracker(CommandQueue executionQueue) override;
 
-        // Metal3: does nothing
         void runGarbageCollection() override;
         bool queryFeatureSupport(Feature feature, void* pInfo = nullptr, size_t infoSize = 0) override;
         FormatSupport queryFormatSupport(Format format) override;
@@ -876,8 +912,29 @@ namespace nvrhi::metal3
         
     private:
         friend class CommandList;
+        friend class CommandListLifetimeTracker;
 
-        uint64_t m_SubmissionSerial = 0;
+        struct SubmittedCommandBuffer
+        {
+            id<MTLCommandBuffer> commandBuffer = nil;
+            uint64_t instance = 0;
+            bool lastInBatch = false;
+        };
+
+        struct QueueState
+        {
+            uint64_t submitted = 0;
+            uint64_t completed = 0;
+            uint64_t firstFailure = 0;
+            std::deque<SubmittedCommandBuffer> pending;
+        };
+
+        void updateCompletedSubmissions();
+        bool submissionsSucceeded(const std::array<uint64_t, uint32_t(CommandQueue::Count)>& submissions) const;
+        EventQuery* getEventQuery(IEventQuery* query);
+        std::array<QueueState, uint32_t(CommandQueue::Count)> m_Queues;
+        std::array<RefCountPtr<CommandListLifetimeTracker>, uint32_t(CommandQueue::Count)> m_DefaultLifetimeTrackers;
+
         CommandList* m_OpenImmediateCommandList = nullptr;
 
         bool m_AftermathEnabled;

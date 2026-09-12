@@ -1602,6 +1602,9 @@ namespace nvrhi::metal3
     CommandList::CommandList(class Device* device, const MTL3Context& context, const CommandListParameters& params)
         : m_Context(context)
             , m_Device(device)
+            , m_LifetimeTracker(params.lifetimeTracker
+                ? static_cast<CommandListLifetimeTracker*>(params.lifetimeTracker->getNativeObject(ObjectTypes::Nvrhi_Metal3_LifetimeTracker).pointer)
+                : device->m_DefaultLifetimeTrackers[uint32_t(params.queueType)].Get())
             , m_UploadManager(context, params.uploadChunkSize, 0, false)
             , m_ArgumentTableManager(context, c_ArgumentTablePageSize, 0, false,
                 c_ArgumentTablePageSize, c_ArgumentTableInitialPageCount)
@@ -1808,6 +1811,12 @@ namespace nvrhi::metal3
         m_UploadManager.submitCommandBuffer(trackedCmdBuffer);
         m_ArgumentTableManager.submitCommandBuffer(trackedCmdBuffer);
         m_TransientIndirectResources.submitCommandBuffer(trackedCmdBuffer);
+        m_LifetimeTracker->m_CommandBuffers.push_back({
+            trackedCmdBuffer,
+            std::move(m_ReferencedBindingSets),
+            std::move(m_ReferencedNativeBuffers),
+            std::move(m_ReferencedNativeResources)
+        });
         [trackedCmdBuffer commit];
         m_RecordingState = RecordingState::Submitted;
     }
