@@ -5,6 +5,7 @@
 #include <Metal/Metal.h>
 #include <atomic>
 #include <cstdio>
+#include <limits>
 
 namespace nvrhi::metal3
 {
@@ -25,9 +26,23 @@ namespace nvrhi::metal3
             messageCallback->message(MessageSeverity::Info, message.c_str());
     }
 
+    void MTL3Context::unsupported(const char* operation) const
+    {
+        error(std::string("[nvrhi] Metal backend does not support ") + operation + ".");
+    }
+
     // device creation
     DeviceHandle createDevice(const DeviceDesc& desc)
     {
+        if (!desc.pDevice || !desc.commonQueue || desc.commonQueue.device != desc.pDevice
+            || ![desc.pDevice supportsFamily:MTLGPUFamilyMetal3]
+            || desc.pDevice.argumentBuffersSupport < MTLArgumentBuffersTier2)
+        {
+            if (desc.errorCB)
+                desc.errorCB->message(MessageSeverity::Error,
+                    "[nvrhi] Native Metal requires a Metal 3 device, argument buffers tier 2, and a matching command queue.");
+            return nullptr;
+        }
         Device* device = new Device(desc);
         return DeviceHandle::Create(device);
     }
@@ -38,11 +53,18 @@ namespace nvrhi::metal3
         m_Context.logBufferLifetime = desc.logBufferLifetime;
         m_Context.messageCallback = desc.errorCB;
 
-        if([m_Context.device supportsFamily:MTLGPUFamilyMetal3] == NO)
+#if __MAC_OS_X_VERSION_MAX_ALLOWED >= 260000
+        if (@available(macOS 26.0, iOS 26.0, *))
         {
-            m_Context.error("[nvrhi] Metal 3 unsupported!");
+            if ([m_Context.device supportsFamily:MTLGPUFamilyApple10])
+                m_Context.maxTextureDimension = 32768;
         }
-        else m_Context.info("[nvrhi] Metal 3 supported");
+#endif
+        const MTLSize threads = m_Context.device.maxThreadsPerThreadgroup;
+        m_Context.info("[nvrhi] Metal limits: texture_dimension=" + std::to_string(m_Context.maxTextureDimension)
+            + " buffer_bytes=" + std::to_string(m_Context.device.maxBufferLength)
+            + " threadgroup_dimensions=" + std::to_string(threads.width) + "x"
+            + std::to_string(threads.height) + "x" + std::to_string(threads.depth));
 
         // queues, resoureces reserve, allocation, etc...
         m_Context.commonQueue = desc.commonQueue;
@@ -189,7 +211,7 @@ namespace nvrhi::metal3
     HeapHandle Device::createHeap(const HeapDesc& d)
     {
         (void)d;
-        m_Context.warning("[nvrhi] Metal3 heaps are not implemented; using placed resources is unsupported.");
+        m_Context.unsupported(__func__);
         return nullptr;
     }
 
@@ -208,22 +230,27 @@ namespace nvrhi::metal3
     bool Device::bindTextureMemory(ITexture* texture, IHeap* heap, uint64_t offset)
     {
         (void)texture; (void)heap; (void)offset;
+        m_Context.unsupported(__func__);
         return false;
     }
 
     StagingTextureHandle Device::createStagingTexture(const TextureDesc& d, CpuAccessMode cpuAccess)
     {
-        // TODO: stub
+        m_Context.unsupported(__func__);
+        return nullptr;
     }
 
     void* Device::mapStagingTexture(IStagingTexture* tex, const TextureSlice& slice, CpuAccessMode cpuAccess, size_t* outRowPitch)
     {
-        // TODO: stub
+        m_Context.unsupported(__func__);
+        if (outRowPitch)
+            *outRowPitch = 0;
+        return nullptr;
     }
 
     void Device::unmapStagingTexture(IStagingTexture* tex)
     {
-        // TODO: stub
+        m_Context.unsupported(__func__);
     }
 
     void Device::getTextureTiling(ITexture* texture, uint32_t* numTiles, PackedMipDesc* desc, TileShape* tileShape, uint32_t* subresourceTilingsNum, SubresourceTiling* subresourceTilings)
@@ -235,13 +262,13 @@ namespace nvrhi::metal3
         (void)subresourceTilingsNum;
         (void)subresourceTilings;
 
-        utils::NotSupported();
+        m_Context.unsupported(__func__);
     }
 
     void Device::updateTextureTileMappings(ITexture* texture, const TextureTilesMapping* tileMappings, uint32_t numTileMappings, CommandQueue executionQueue)
     {
         (void)texture; (void)tileMappings; (void)numTileMappings; (void)executionQueue;
-        utils::NotSupported();
+        m_Context.unsupported(__func__);
     }
 
     SamplerFeedbackTextureHandle Device::createSamplerFeedbackTexture(ITexture* pairedTexture, const SamplerFeedbackTextureDesc& desc)
@@ -249,7 +276,7 @@ namespace nvrhi::metal3
         (void)pairedTexture;
         (void)desc;
 
-        utils::NotSupported();
+        m_Context.unsupported(__func__);
         return nullptr;
     }
 
@@ -259,7 +286,7 @@ namespace nvrhi::metal3
         (void)texture;
         (void)pairedTexture;
 
-        utils::NotSupported();
+        m_Context.unsupported(__func__);
         return nullptr;
     }
 
@@ -336,7 +363,7 @@ namespace nvrhi::metal3
         (void)buffer;
         (void)heap;
         (void)offset;
-        utils::NotSupported();
+        m_Context.unsupported(__func__);
         return false;
     }
 
@@ -369,8 +396,8 @@ namespace nvrhi::metal3
     {
         (void)constants;
         (void)numConstants;
-        utils::NotSupported();
-        return baseShader;
+        m_Context.unsupported(__func__);
+        return nullptr;
     }
     EventQueryHandle Device::createEventQuery()
     {
@@ -468,6 +495,7 @@ namespace nvrhi::metal3
         case Feature::ComputeQueue:
         case Feature::CopyQueue:
         case Feature::ConstantBufferRanges:
+        case Feature::DeferredCommandLists:
             return true;
         default:
             return false;
@@ -538,36 +566,34 @@ namespace nvrhi::metal3
         }
     }
 
-    // ---- stubs ----
     TimerQueryHandle Device::createTimerQuery()
     {
-        return TimerQueryHandle::Create(new TimerQuery());
+        m_Context.unsupported(__func__);
+        return nullptr;
     }
 
     bool Device::pollTimerQuery(ITimerQuery* query)
     {
-        auto* timer = static_cast<TimerQuery*>(query);
-        return timer && timer->resolved;
+        m_Context.unsupported(__func__);
+        return false;
     }
 
     float Device::getTimerQueryTime(ITimerQuery* query)
     {
-        auto* timer = static_cast<TimerQuery*>(query);
-        return timer ? timer->time : 0.f;
+        m_Context.unsupported(__func__);
+        return std::numeric_limits<float>::quiet_NaN();
     }
 
     void Device::resetTimerQuery(ITimerQuery* query)
     {
-        auto* timer = static_cast<TimerQuery*>(query);
-        if (!timer) return;
-        timer->resolved = true;
-        timer->time = 0.f;
+        m_Context.unsupported(__func__);
     }
 
     MeshletPipelineHandle Device::createMeshletPipeline(const MeshletPipelineDesc& desc, FramebufferInfo const& fbinfo)
     {
         (void)desc;
         (void)fbinfo;
+        m_Context.unsupported(__func__);
         return nullptr;
     }
 
@@ -575,18 +601,21 @@ namespace nvrhi::metal3
     {
         (void)desc;
         (void)fb;
+        m_Context.unsupported(__func__);
         return nullptr;
     }
 
     BindingLayoutHandle Device::createBindlessLayout(const BindlessLayoutDesc& desc)
     {
         (void)desc;
+        m_Context.unsupported(__func__);
         return nullptr;
     }
 
     DescriptorTableHandle Device::createDescriptorTable(IBindingLayout* layout)
     {
         (void)layout;
+        m_Context.unsupported(__func__);
         return nullptr;
     }
 
@@ -595,38 +624,40 @@ namespace nvrhi::metal3
         (void)descriptorTable;
         (void)newSize;
         (void)keepContents;
+        m_Context.unsupported(__func__);
     }
 
     bool Device::writeDescriptorTable(IDescriptorTable* descriptorTable, const BindingSetItem& item)
     {
         (void)descriptorTable;
         (void)item;
+        m_Context.unsupported(__func__);
         return false;
     }
 
     rt::OpacityMicromapHandle Device::createOpacityMicromap(const rt::OpacityMicromapDesc& desc)
     {
-        auto* omm = new DummyOpacityMicromap();
-        omm->desc = desc;
-        return rt::OpacityMicromapHandle::Create(omm);
+        m_Context.unsupported(__func__);
+        return nullptr;
     }
 
     rt::AccelStructHandle Device::createAccelStruct(const rt::AccelStructDesc& desc)
     {
-        auto* accel = new DummyAccelStruct();
-        accel->desc = desc;
-        return rt::AccelStructHandle::Create(accel);
+        m_Context.unsupported(__func__);
+        return nullptr;
     }
 
     MemoryRequirements Device::getAccelStructMemoryRequirements(rt::IAccelStruct* as)
     {
         (void)as;
+        m_Context.unsupported(__func__);
         return MemoryRequirements{};
     }
 
     rt::cluster::OperationSizeInfo Device::getClusterOperationSizeInfo(const rt::cluster::OperationParams& params)
     {
         (void)params;
+        m_Context.unsupported(__func__);
         return rt::cluster::OperationSizeInfo{};
     }
 
@@ -678,6 +709,7 @@ namespace nvrhi::metal3
             if (!commandList || commandList->m_Device != this
                 || commandList->m_Desc.queueType != executionQueue
                 || commandList->m_RecordingState != CommandList::RecordingState::Closed
+                || commandList->m_RecordingFailed
                 || commandList->trackedCmdBuffer.status != MTLCommandBufferStatusNotEnqueued)
                 break;
             commandList->m_RecordingState = CommandList::RecordingState::PendingSubmission;
@@ -736,15 +768,42 @@ namespace nvrhi::metal3
 
     FormatSupport Device::queryFormatSupport(Format format)
     {
-        if (convertFormat(format) == MTLPixelFormatInvalid)
+        if (uint32_t(format) >= uint32_t(Format::COUNT) || format == Format::UNKNOWN)
             return FormatSupport::None;
-
+        FormatSupport support = FormatSupport::None;
+        if (convertVertexFormat(format) != MTLVertexFormatInvalid)
+            support = support | FormatSupport::Buffer | FormatSupport::VertexBuffer;
+        if (format == Format::R16_UINT || format == Format::R32_UINT)
+            support = support | FormatSupport::Buffer | FormatSupport::IndexBuffer;
+        if (convertFormat(format) == MTLPixelFormatInvalid)
+            return support;
         const FormatInfo& info = getFormatInfo(format);
-        FormatSupport support = FormatSupport::Texture | FormatSupport::ShaderLoad | FormatSupport::ShaderSample;
+        if (info.blockSize > 1)
+            return m_Context.device.supportsBCTextureCompression
+                ? support | FormatSupport::Texture | FormatSupport::ShaderLoad | FormatSupport::ShaderSample
+                : support;
+        if (format == Format::D24S8 && !m_Context.device.depth24Stencil8PixelFormatSupported)
+            return support;
+        support = support | FormatSupport::Texture | FormatSupport::ShaderLoad;
+        const bool float32 = format == Format::R32_FLOAT || format == Format::RG32_FLOAT
+            || format == Format::RGBA32_FLOAT || format == Format::D32 || format == Format::D32S8;
+        if (format != Format::R32_UINT && (!float32 || m_Context.device.supports32BitFloatFiltering))
+            support = support | FormatSupport::ShaderSample;
         if (info.hasDepth || info.hasStencil)
-            support = support | FormatSupport::DepthStencil;
-        else
-            support = support | FormatSupport::RenderTarget | FormatSupport::ShaderUavLoad | FormatSupport::ShaderUavStore;
+            return support | FormatSupport::DepthStencil;
+        support = support | FormatSupport::RenderTarget;
+        if (format != Format::R32_UINT)
+            support = support | FormatSupport::Blendable;
+        if (!info.isSRGB)
+            support = support | FormatSupport::Buffer;
+        if ((!info.isSRGB && format != Format::BGRA8_UNORM) || [m_Context.device supportsFamily:MTLGPUFamilyApple2])
+            support = support | FormatSupport::ShaderUavStore;
+        const MTLReadWriteTextureTier tier = m_Context.device.readWriteTextureSupport;
+        if ((tier >= MTLReadWriteTextureTier1 && (format == Format::R32_UINT || format == Format::R32_FLOAT))
+            || (tier >= MTLReadWriteTextureTier2 && (format == Format::RGBA8_UNORM
+                || format == Format::RGBA16_FLOAT || format == Format::RGBA32_FLOAT
+                || format == Format::R16_FLOAT || format == Format::R8_UNORM)))
+            support = support | FormatSupport::ShaderUavLoad;
         return support;
     }
 
@@ -771,6 +830,7 @@ namespace nvrhi::metal3
         (void)layout;
         (void)rows;
         (void)columns;
+        m_Context.unsupported(__func__);
         return 0;
     }
 }

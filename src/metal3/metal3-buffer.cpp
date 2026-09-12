@@ -4,8 +4,16 @@ namespace nvrhi::metal3
 {
     BufferHandle Device::createBuffer(const BufferDesc& d)
     {
-        if (d.byteSize == 0)
+        if (d.byteSize == 0 || d.byteSize > m_Context.device.maxBufferLength)
+        {
+            m_Context.error("[nvrhi] Metal buffer size is zero or exceeds maxBufferLength.");
             return nullptr;
+        }
+        if (d.isVirtual || d.sharedResourceFlags != SharedResourceFlags::None)
+        {
+            m_Context.error("[nvrhi] Metal virtual and shared buffers are unsupported.");
+            return nullptr;
+        }
 
         Buffer* buffer = new Buffer();
         buffer->desc = d;

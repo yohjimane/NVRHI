@@ -1723,6 +1723,12 @@ namespace nvrhi::metal3
 #endif
     }
 
+    void CommandList::unsupported(const char* operation)
+    {
+        m_RecordingFailed = true;
+        m_Context.unsupported(operation);
+    }
+
     void CommandList::open()
     {
         std::lock_guard<std::mutex> lock(m_Device->m_Mutex);
@@ -1732,7 +1738,7 @@ namespace nvrhi::metal3
             return;
         }
         if (m_Desc.enableImmediateExecution &&
-            (m_RecordingState == RecordingState::Closed || m_Device->m_OpenImmediateCommandList))
+            ((m_RecordingState == RecordingState::Closed && !m_RecordingFailed) || m_Device->m_OpenImmediateCommandList))
         {
             m_Context.error("[nvrhi] Immediate Metal command lists must be executed before reopening and cannot be recorded concurrently.");
             return;
@@ -1750,6 +1756,7 @@ namespace nvrhi::metal3
             return;
         }
         m_RecordingState = RecordingState::Open;
+        m_RecordingFailed = false;
         if (m_Desc.enableImmediateExecution)
             m_Device->m_OpenImmediateCommandList = this;
 
@@ -3676,15 +3683,13 @@ namespace nvrhi::metal3
             m_ReferencedBindingSets.push_back(bindingSet);
     }
 
-    // ---- stubs ----
-
-    // no staging texture copy support
     void CommandList::copyTexture(IStagingTexture* dest, const TextureSlice& destSlice, ITexture* src, const TextureSlice& srcSlice)
     {
         (void)dest;
         (void)destSlice;
         (void)src;
         (void)srcSlice;
+        unsupported(__func__);
     }
 
     void CommandList::copyTexture(ITexture* dest, const TextureSlice& destSlice, IStagingTexture* src, const TextureSlice& srcSlice)
@@ -3693,9 +3698,9 @@ namespace nvrhi::metal3
         (void)destSlice;
         (void)src;
         (void)srcSlice;
+        unsupported(__func__);
     }
 
-    // TODO?: no push constant support yet
     void CommandList::setPushConstants(const void* data, size_t byteSize)
     {
         m_PushConstantSize = std::min(byteSize, m_PushConstants.size());
@@ -3703,41 +3708,41 @@ namespace nvrhi::metal3
             std::memcpy(m_PushConstants.data(), data, m_PushConstantSize);
     }
 
-    void CommandList::dispatchIndirect(uint32_t offsetBytes) { (void)offsetBytes; }
-    void CommandList::setMeshletState(const MeshletState& state) { m_CurrentMeshletState = state; m_CurrentMeshletStateValid = true; }
-    void CommandList::dispatchMesh(uint32_t groupsX, uint32_t groupsY, uint32_t groupsZ) { (void)groupsX; (void)groupsY; (void)groupsZ; }
-    void CommandList::dispatchMeshIndirect(uint32_t offsetBytes, uint32_t maxDrawCount) { (void)offsetBytes; (void)maxDrawCount; }
-    void CommandList::dispatchMeshIndirectCount(uint32_t paramOffsetBytes, uint32_t countOffsetBytes, uint32_t maxDrawCount) { (void)paramOffsetBytes; (void)countOffsetBytes; (void)maxDrawCount; }
-    void CommandList::setRayTracingState(const rt::State& state) { m_CurrentRayTracingState = state; m_CurrentRayTracingStateValid = true; }
-    void CommandList::dispatchRays(const rt::DispatchRaysArguments& args) { (void)args; }
-    void CommandList::buildOpacityMicromap(rt::IOpacityMicromap* omm, const rt::OpacityMicromapDesc& desc) { (void)omm; (void)desc; }
-    void CommandList::copyRaytracingAccelerationStructure(rt::IAccelStruct* destination, rt::IAccelStruct* source) { (void)destination; (void)source; }
-    void CommandList::buildBottomLevelAccelStruct(rt::IAccelStruct* as, const rt::GeometryDesc* pGeometries, size_t numGeometries, rt::AccelStructBuildFlags buildFlags) { (void)as; (void)pGeometries; (void)numGeometries; (void)buildFlags; }
-    void CommandList::compactBottomLevelAccelStructs() {}
-    void CommandList::buildTopLevelAccelStruct(rt::IAccelStruct* as, const rt::InstanceDesc* pInstances, size_t numInstances, rt::AccelStructBuildFlags buildFlags) { (void)as; (void)pInstances; (void)numInstances; (void)buildFlags; }
-    void CommandList::buildTopLevelAccelStructFromBuffer(rt::IAccelStruct* as, nvrhi::IBuffer* instanceBuffer, uint64_t instanceBufferOffset, size_t numInstances, rt::AccelStructBuildFlags buildFlags) { (void)as; (void)instanceBuffer; (void)instanceBufferOffset; (void)numInstances; (void)buildFlags; }
-    void CommandList::executeMultiIndirectClusterOperation(const rt::cluster::OperationDesc& desc) { (void)desc; }
-    void CommandList::convertCoopVecMatrices(coopvec::ConvertMatrixLayoutDesc const* convertDescs, size_t numDescs) { (void)convertDescs; (void)numDescs; }
-    void CommandList::beginTimerQuery(ITimerQuery* query) { (void)query; }
-    void CommandList::endTimerQuery(ITimerQuery* query) { (void)query; }
-    void CommandList::setEnableAutomaticBarriers(bool enable) { (void)enable; }
-    void CommandList::setResourceStatesForBindingSet(IBindingSet* bindingSet) { (void)bindingSet; }
-    void CommandList::setEnableUavBarriersForTexture(ITexture* texture, bool enableBarriers) { (void)texture; (void)enableBarriers; }
-    void CommandList::setEnableUavBarriersForBuffer(IBuffer* buffer, bool enableBarriers) { (void)buffer; (void)enableBarriers; }
-    void CommandList::beginTrackingTextureState(ITexture* texture, TextureSubresourceSet subresources, ResourceStates stateBits) { (void)texture; (void)subresources; (void)stateBits; }
-    void CommandList::beginTrackingBufferState(IBuffer* buffer, ResourceStates stateBits) { (void)buffer; (void)stateBits; }
-    void CommandList::setTextureState(ITexture* texture, TextureSubresourceSet subresources, ResourceStates stateBits) { (void)texture; (void)subresources; (void)stateBits; }
-    void CommandList::setBufferState(IBuffer* buffer, ResourceStates stateBits) { (void)buffer; (void)stateBits; }
-    void CommandList::setAccelStructState(rt::IAccelStruct* as, ResourceStates stateBits) { (void)as; (void)stateBits; }
-    void CommandList::setPermanentTextureState(ITexture* texture, ResourceStates stateBits) { (void)texture; (void)stateBits; }
-    void CommandList::setPermanentBufferState(IBuffer* buffer, ResourceStates stateBits) { (void)buffer; (void)stateBits; }
-    void CommandList::commitBarriers() {}
-    ResourceStates CommandList::getTextureSubresourceState(ITexture* texture, ArraySlice arraySlice, MipLevel mipLevel) { (void)texture; (void)arraySlice; (void)mipLevel; return ResourceStates::Unknown; }
-    ResourceStates CommandList::getBufferState(IBuffer* buffer) { (void)buffer; return ResourceStates::Unknown; }
-    void CommandList::clearSamplerFeedbackTexture(ISamplerFeedbackTexture* texture) { (void)texture; }
-    void CommandList::decodeSamplerFeedbackTexture(IBuffer* buffer, ISamplerFeedbackTexture* texture, Format format) { (void)buffer; (void)texture; (void)format; }
-    void CommandList::setSamplerFeedbackTextureState(ISamplerFeedbackTexture* texture, ResourceStates stateBits) { (void)texture; (void)stateBits; }
-    void CommandList::beginMarker(const char* name) { (void)name; }
-    void CommandList::endMarker() {}
+    void CommandList::dispatchIndirect(uint32_t offsetBytes) { (void)offsetBytes; unsupported(__func__); }
+    void CommandList::setMeshletState(const MeshletState& state) { (void)state; unsupported(__func__); }
+    void CommandList::dispatchMesh(uint32_t groupsX, uint32_t groupsY, uint32_t groupsZ) { (void)groupsX; (void)groupsY; (void)groupsZ; unsupported(__func__); }
+    void CommandList::dispatchMeshIndirect(uint32_t offsetBytes, uint32_t maxDrawCount) { (void)offsetBytes; (void)maxDrawCount; unsupported(__func__); }
+    void CommandList::dispatchMeshIndirectCount(uint32_t paramOffsetBytes, uint32_t countOffsetBytes, uint32_t maxDrawCount) { (void)paramOffsetBytes; (void)countOffsetBytes; (void)maxDrawCount; unsupported(__func__); }
+    void CommandList::setRayTracingState(const rt::State& state) { (void)state; unsupported(__func__); }
+    void CommandList::dispatchRays(const rt::DispatchRaysArguments& args) { (void)args; unsupported(__func__); }
+    void CommandList::buildOpacityMicromap(rt::IOpacityMicromap* omm, const rt::OpacityMicromapDesc& desc) { (void)omm; (void)desc; unsupported(__func__); }
+    void CommandList::copyRaytracingAccelerationStructure(rt::IAccelStruct* destination, rt::IAccelStruct* source) { (void)destination; (void)source; unsupported(__func__); }
+    void CommandList::buildBottomLevelAccelStruct(rt::IAccelStruct* as, const rt::GeometryDesc* pGeometries, size_t numGeometries, rt::AccelStructBuildFlags buildFlags) { (void)as; (void)pGeometries; (void)numGeometries; (void)buildFlags; unsupported(__func__); }
+    void CommandList::compactBottomLevelAccelStructs() { unsupported(__func__); }
+    void CommandList::buildTopLevelAccelStruct(rt::IAccelStruct* as, const rt::InstanceDesc* pInstances, size_t numInstances, rt::AccelStructBuildFlags buildFlags) { (void)as; (void)pInstances; (void)numInstances; (void)buildFlags; unsupported(__func__); }
+    void CommandList::buildTopLevelAccelStructFromBuffer(rt::IAccelStruct* as, nvrhi::IBuffer* instanceBuffer, uint64_t instanceBufferOffset, size_t numInstances, rt::AccelStructBuildFlags buildFlags) { (void)as; (void)instanceBuffer; (void)instanceBufferOffset; (void)numInstances; (void)buildFlags; unsupported(__func__); }
+    void CommandList::executeMultiIndirectClusterOperation(const rt::cluster::OperationDesc& desc) { (void)desc; unsupported(__func__); }
+    void CommandList::convertCoopVecMatrices(coopvec::ConvertMatrixLayoutDesc const* convertDescs, size_t numDescs) { (void)convertDescs; (void)numDescs; unsupported(__func__); }
+    void CommandList::beginTimerQuery(ITimerQuery* query) { (void)query; unsupported(__func__); }
+    void CommandList::endTimerQuery(ITimerQuery* query) { (void)query; unsupported(__func__); }
+    void CommandList::setEnableAutomaticBarriers(bool enable) { (void)enable; unsupported(__func__); }
+    void CommandList::setResourceStatesForBindingSet(IBindingSet* bindingSet) { (void)bindingSet; unsupported(__func__); }
+    void CommandList::setEnableUavBarriersForTexture(ITexture* texture, bool enableBarriers) { (void)texture; (void)enableBarriers; unsupported(__func__); }
+    void CommandList::setEnableUavBarriersForBuffer(IBuffer* buffer, bool enableBarriers) { (void)buffer; unsupported(__func__); }
+    void CommandList::beginTrackingTextureState(ITexture* texture, TextureSubresourceSet subresources, ResourceStates stateBits) { (void)texture; (void)subresources; (void)stateBits; unsupported(__func__); }
+    void CommandList::beginTrackingBufferState(IBuffer* buffer, ResourceStates stateBits) { (void)buffer; (void)stateBits; unsupported(__func__); }
+    void CommandList::setTextureState(ITexture* texture, TextureSubresourceSet subresources, ResourceStates stateBits) { (void)texture; (void)subresources; (void)stateBits; unsupported(__func__); }
+    void CommandList::setBufferState(IBuffer* buffer, ResourceStates stateBits) { (void)buffer; (void)stateBits; unsupported(__func__); }
+    void CommandList::setAccelStructState(rt::IAccelStruct* as, ResourceStates stateBits) { (void)as; (void)stateBits; unsupported(__func__); }
+    void CommandList::setPermanentTextureState(ITexture* texture, ResourceStates stateBits) { (void)texture; (void)stateBits; unsupported(__func__); }
+    void CommandList::setPermanentBufferState(IBuffer* buffer, ResourceStates stateBits) { (void)buffer; (void)stateBits; unsupported(__func__); }
+    void CommandList::commitBarriers() { unsupported(__func__); }
+    ResourceStates CommandList::getTextureSubresourceState(ITexture* texture, ArraySlice arraySlice, MipLevel mipLevel) { (void)texture; (void)arraySlice; (void)mipLevel; unsupported(__func__); return ResourceStates::Unknown; }
+    ResourceStates CommandList::getBufferState(IBuffer* buffer) { (void)buffer; unsupported(__func__); return ResourceStates::Unknown; }
+    void CommandList::clearSamplerFeedbackTexture(ISamplerFeedbackTexture* texture) { (void)texture; unsupported(__func__); }
+    void CommandList::decodeSamplerFeedbackTexture(IBuffer* buffer, ISamplerFeedbackTexture* texture, Format format) { (void)buffer; (void)texture; (void)format; unsupported(__func__); }
+    void CommandList::setSamplerFeedbackTextureState(ISamplerFeedbackTexture* texture, ResourceStates stateBits) { (void)texture; (void)stateBits; unsupported(__func__); }
+    void CommandList::beginMarker(const char* name) { if (name) [trackedCmdBuffer pushDebugGroup:[NSString stringWithUTF8String:name]]; }
+    void CommandList::endMarker() { [trackedCmdBuffer popDebugGroup]; }
     nvrhi::IDevice* CommandList::getDevice() { return m_Device; }
 }

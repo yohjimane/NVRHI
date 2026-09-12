@@ -3,6 +3,7 @@
 #include <atomic>
 #include <thread>
 #include <cstdio>
+#include <cmath>
 #include <stdexcept>
 
 namespace
@@ -260,6 +261,62 @@ namespace
         f.checkErrors();
     }
 
+    void unsupportedCapabilities()
+    {
+        Fixture f;
+        const auto compressed = f.device->queryFormatSupport(nvrhi::Format::BC1_UNORM);
+        require((compressed & (nvrhi::FormatSupport::RenderTarget | nvrhi::FormatSupport::ShaderUavStore)) == nvrhi::FormatSupport::None,
+            "Compressed format advertises unsupported render/storage usage");
+        require(f.device->queryFeatureSupport(nvrhi::Feature::DeferredCommandLists), "Implemented deferred command lists are not advertised");
+        const auto integer = f.device->queryFormatSupport(nvrhi::Format::R32_UINT);
+        require((integer & (nvrhi::FormatSupport::Blendable | nvrhi::FormatSupport::ShaderSample)) == nvrhi::FormatSupport::None,
+            "Integer format advertises blending or filtering");
+        nvrhi::TextureDesc texture;
+        texture.width = texture.height = 4;
+        texture.format = nvrhi::Format::BC1_UNORM;
+        texture.isUAV = true;
+        f.expectError([&] { require(f.device->createTexture(texture) == nullptr, "Compressed storage texture accepted"); });
+        texture.isUAV = false;
+        texture.isRenderTarget = true;
+        f.expectError([&] { require(f.device->createTexture(texture) == nullptr, "Compressed render target accepted"); });
+        f.expectError([&] { require(f.device->createTimerQuery() == nullptr, "Unimplemented timer returned a usable handle"); });
+        f.expectError([&] { require(std::isnan(f.device->getTimerQueryTime(nullptr)), "Unsupported timer returned a fabricated duration"); });
+        f.expectError([&] { require(f.device->createRayTracingPipeline({}) == nullptr, "Unimplemented ray tracing returned a usable pipeline"); });
+        f.expectError([&] { require(f.device->createAccelStruct({}) == nullptr, "Unimplemented acceleration structure returned a usable handle"); });
+        f.expectError([&] { require(f.device->createStagingTexture(texture, nvrhi::CpuAccessMode::Read) == nullptr, "Unimplemented staging texture accepted"); });
+        nvrhi::BufferDesc buffer;
+        buffer.byteSize = f.desc.pDevice.maxBufferLength + 1;
+        f.expectError([&] { require(f.device->createBuffer(buffer) == nullptr, "Buffer exceeding device limit accepted"); });
+        nvrhi::metal3::DeviceDesc invalid = f.desc;
+        invalid.commonQueue = nil;
+        f.expectError([&] { require(nvrhi::metal3::createDevice(invalid) == nullptr, "Device without a queue accepted"); });
+        f.checkErrors();
+    }
+
+    void unsupportedRecording()
+    {
+        Fixture f;
+        auto invalid = f.list(true);
+        auto valid = f.list();
+        invalid->open();
+        invalid->clearBufferUInt(f.buffer, 1);
+        f.expectError([&] { invalid->dispatchIndirect(0); });
+        invalid->close();
+        f.record(valid, 7, 1);
+        nvrhi::ICommandList* batch[] = {valid, invalid};
+        f.expectError([&] { require(f.device->executeCommandLists(batch, 2) == 0, "Unsupported command recording was submitted"); });
+        require(f.device->waitForIdle(), "Idle wait after rejected batch failed");
+        require(f.words[0] == 0x55555555u && f.words[1] == 0x55555555u, "Rejected batch partially executed");
+        f.execute(valid);
+        require(f.device->waitForIdle(), "Valid list from rejected batch failed");
+        require(f.words[0] == 0x55555555u && f.words[1] == 7, "Valid list was damaged by batch rejection");
+        f.record(invalid, 9);
+        f.execute(invalid);
+        require(f.device->waitForIdle(), "Re-recorded immediate list failed");
+        require(f.words[0] == 9 && f.words[1] == 7, "Failed immediate recording could not recover cleanly");
+        f.checkErrors();
+    }
+
     void queueDependencies()
     {
         Fixture f;
@@ -440,6 +497,8 @@ int main()
             queueDependencies();
             simultaneousWaiters();
             lifetimeTrackers();
+            unsupportedCapabilities();
+            unsupportedRecording();
             std::puts("PASS: submission, event rearm, queue dependencies, concurrent waits, and lifetime tracking");
             return 0;
         }

@@ -5,8 +5,7 @@ namespace nvrhi::metal3
 
     rt::PipelineHandle Device::createRayTracingPipeline(const rt::PipelineDesc& desc)
     {
-        RayTracingPipeline* pipeline = new RayTracingPipeline();
-        pipeline->desc = desc;
-        return rt::PipelineHandle::Create(pipeline);
+        m_Context.unsupported(__func__);
+        return nullptr;
     }
 }

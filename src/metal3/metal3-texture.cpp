@@ -31,16 +31,29 @@ namespace nvrhi::metal3
     TextureHandle Device::createTexture(const TextureDesc& d)
     {
         MTLPixelFormat pixelFormat = convertFormat(d.format);
-        if (pixelFormat == MTLPixelFormatInvalid)
+        const FormatSupport support = queryFormatSupport(d.format);
+        if ((support & FormatSupport::Texture) == FormatSupport::None
+            || (d.isRenderTarget && (support & (FormatSupport::DepthStencil | FormatSupport::RenderTarget)) == FormatSupport::None)
+            || (d.isUAV && (support & FormatSupport::ShaderUavStore) == FormatSupport::None))
         {
             m_Context.error("[nvrhi] Unsupported Metal texture format for texture '" + d.debugName +
                 "' (format=" + std::to_string(static_cast<int>(d.format)) + ").");
             return nullptr;
         }
 
-        if (d.isTiled || d.isVirtual)
+        if (d.isTiled || d.isVirtual || d.isShadingRateSurface || d.sharedResourceFlags != SharedResourceFlags::None)
         {
-            m_Context.error("[nvrhi] Metal3 tiled/virtual textures are not implemented.");
+            m_Context.error("[nvrhi] Metal tiled, virtual, shading-rate, and shared textures are unsupported.");
+            return nullptr;
+        }
+
+        const uint32_t maxDimension = d.dimension == TextureDimension::Texture3D ? 2048 : m_Context.maxTextureDimension;
+        if (!d.width || !d.height || !d.depth || !d.arraySize || !d.mipLevels
+            || d.width > maxDimension || d.height > maxDimension || d.depth > 2048 || d.arraySize > 2048
+            || ![m_Context.device supportsTextureSampleCount:d.sampleCount]
+            || (d.sampleCount > 1 && (d.mipLevels != 1 || d.isUAV)))
+        {
+            m_Context.error("[nvrhi] Metal texture dimensions, sample count, or multisample usage exceed supported limits.");
             return nullptr;
         }
 
@@ -60,11 +73,6 @@ namespace nvrhi::metal3
 
         MTLSizeAndAlign sizeAndAlign = [m_Context.device heapTextureSizeAndAlignWithDescriptor:td];
 
-        Texture* texture = new Texture();
-        // cache tex descriptor size and alignment for use for device.getTextureMemoryRequirements(...)
-        texture->memSize = sizeAndAlign.size;
-        texture->memAlign = sizeAndAlign.align;
-
         id<MTLTexture> nativeTexture = [m_Context.device newTextureWithDescriptor:td];
         if (!nativeTexture)
         {
@@ -72,6 +80,9 @@ namespace nvrhi::metal3
             return nullptr;
         }
 
+        Texture* texture = new Texture();
+        texture->memSize = sizeAndAlign.size;
+        texture->memAlign = sizeAndAlign.align;
         if (!d.debugName.empty())
             nativeTexture.label = [NSString stringWithUTF8String:d.debugName.c_str()];
 

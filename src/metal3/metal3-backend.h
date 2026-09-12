@@ -39,14 +39,7 @@ namespace nvrhi::metal3
     class BindingLayout;
     class BindingSet;
     class MeshletPipeline;
-    class RayTracingPipeline;
     class EventQuery;
-    class TimerQuery;
-    // dummy classes for non essential or planned for future features
-    // Not planned
-    class DummyOpacityMicromap;
-    // TODO: for future when RT backend will be added
-    class DummyAccelStruct;
 
     // useful for shader reflection
     enum class MscArgumentType : uint8_t
@@ -148,10 +141,12 @@ namespace nvrhi::metal3
         id<MTLCommandQueue> commonQueue;
 
         bool logBufferLifetime = false;
+        uint32_t maxTextureDimension = 16384;
         IMessageCallback* messageCallback = nullptr;
         void error(const std::string& message) const;
         void warning(const std::string& message) const;
         void info(const std::string& message) const;
+        void unsupported(const char* operation) const;
     };
     // created at time of shader creation, using reflection data
     MetalStageBindingPlan createMetalStageBindingPlan(ShaderType stage, const MscShaderReflection& reflection);
@@ -333,13 +328,6 @@ namespace nvrhi::metal3
         Object getNativeView(ObjectType objectType, Format format = Format::UNKNOWN, TextureSubresourceSet subresources = AllSubresources, TextureDimension dimension = TextureDimension::Unknown, bool isReadOnlyDSV = false, std::optional<ComponentMapping> overrideComponentMapping = std::nullopt) override;
     };
 
-    //TODO: stub
-    class StagingTexture : public RefCounter<IStagingTexture>
-    {
-    public:
-        TextureDesc desc;
-        const TextureDesc& getDesc() const override { return desc; }
-    };
 
     class Buffer : public RefCounter<IBuffer>
     {
@@ -504,58 +492,6 @@ namespace nvrhi::metal3
         std::array<uint64_t, uint32_t(CommandQueue::Count)> submissions{};
         bool failureReported = false;
     };
-    // TODO: stubs
-    class TimerQuery : public RefCounter<ITimerQuery> { public: bool resolved = true; float time = 0.f; };
-
-    class ShaderTable : public RefCounter<rt::IShaderTable>
-    {
-    public:
-        rt::ShaderTableDesc desc;
-        rt::IPipeline* pipeline = nullptr;
-        uint32_t numEntries = 0;
-        rt::ShaderTableDesc const& getDesc() const override { return desc; }
-        uint32_t getNumEntries() const override { return numEntries; }
-        rt::IPipeline* getPipeline() const override { return pipeline; }
-        void setRayGenerationShader(const char* exportName, IBindingSet* bindings = nullptr) override { (void)exportName; (void)bindings; numEntries = std::max(numEntries, 1u); }
-        int addMissShader(const char* exportName, IBindingSet* bindings = nullptr) override { (void)exportName; (void)bindings; return int(numEntries++); }
-        int addHitGroup(const char* exportName, IBindingSet* bindings = nullptr) override { (void)exportName; (void)bindings; return int(numEntries++); }
-        int addCallableShader(const char* exportName, IBindingSet* bindings = nullptr) override { (void)exportName; (void)bindings; return int(numEntries++); }
-        void clearMissShaders() override {}
-        void clearHitShaders() override {}
-        void clearCallableShaders() override {}
-    };
-
-    class RayTracingPipeline : public RefCounter<rt::IPipeline>
-    {
-    public:
-        rt::PipelineDesc desc;
-        const rt::PipelineDesc& getDesc() const override { return desc; }
-        rt::ShaderTableHandle createShaderTable(rt::ShaderTableDesc const& tableDesc = rt::ShaderTableDesc()) override
-        {
-            ShaderTable* table = new ShaderTable();
-            table->desc = tableDesc;
-            table->pipeline = this;
-            return rt::ShaderTableHandle::Create(table);
-        }
-    };
-
-    class DummyOpacityMicromap : public RefCounter<rt::IOpacityMicromap>
-    {
-    public:
-        rt::OpacityMicromapDesc desc;
-        const rt::OpacityMicromapDesc& getDesc() const override { return desc; }
-        bool isCompacted() const override { return false; }
-        uint64_t getDeviceAddress() const override { return 0; }
-    };
-
-    class DummyAccelStruct : public RefCounter<rt::IAccelStruct>
-    {
-    public:
-        rt::AccelStructDesc desc;
-        const rt::AccelStructDesc& getDesc() const override { return desc; }
-        bool isCompacted() const override { return false; }
-        uint64_t getDeviceAddress() const override { return 0; }
-    };
 
     // commandList impl
     class CommandList final : public RefCounter<nvrhi::metal3::ICommandList>
@@ -683,6 +619,8 @@ namespace nvrhi::metal3
         };
 
         RecordingState m_RecordingState = RecordingState::Initial;
+        bool m_RecordingFailed = false;
+        void unsupported(const char* operation);
         void submit();
 
         struct TracyGpuScopeDesc
@@ -714,12 +652,8 @@ namespace nvrhi::metal3
         // Cache for user-provided state
         GraphicsState m_CurrentGraphicsState;
         ComputeState m_CurrentComputeState;
-        MeshletState m_CurrentMeshletState;
-        rt::State m_CurrentRayTracingState;
         bool m_CurrentGraphicsStateValid = false;
         bool m_CurrentComputeStateValid = false;
-        bool m_CurrentMeshletStateValid = false;
-        bool m_CurrentRayTracingStateValid = false;
         bool m_GeometryEmulationDrawStateValid = false;
         // Holds the uploaded IRRuntimeVertexBuffers table for the active
         // geometry-emulation draw; object shaders read this to fetch app vertex buffers.
