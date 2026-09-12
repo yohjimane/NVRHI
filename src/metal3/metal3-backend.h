@@ -534,7 +534,7 @@ namespace nvrhi::metal3
         std::vector<Page> pages;
         id<MTLCounterSet> counterSet = nil;
         id<MTLComputePipelineState> markerPipeline = nil;
-        uint64_t frequency = 0;
+        bool timestampsInNanoseconds = false;
     };
 
     class TimerQuery : public RefCounter<ITimerQuery>
@@ -549,7 +549,8 @@ namespace nvrhi::metal3
         id<MTLCommandBuffer> commandBuffer = nil;
         bool started = false;
         bool ended = false;
-        uint64_t frequency = 0;
+        MTLTimestamp cpuStartTimestamp = 0;
+        MTLTimestamp gpuStartTimestamp = 0;
     };
 
     class CommandListLifetimeTracker : public RefCounter<ICommandListLifetimeTracker>

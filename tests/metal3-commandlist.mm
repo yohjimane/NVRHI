@@ -345,8 +345,14 @@ namespace
                 std::this_thread::yield();
             }
             const float elapsed = f.device->getTimerQueryTime(query);
-            require(std::isfinite(elapsed) && elapsed >= float(delayMs) * 0.001f && elapsed < 5.f,
+            require(std::isfinite(elapsed) && elapsed >= float(delayMs) * 0.001f,
                 "Reused GPU timer omitted its current GPU wait or returned stale samples");
+            [native waitUntilCompleted];
+            const double commandBufferDuration = native.GPUEndTime - native.GPUStartTime;
+            require(std::isfinite(commandBufferDuration) && commandBufferDuration > 0.0,
+                "Native command buffer GPU duration is unavailable");
+            require(double(elapsed) <= commandBufferDuration + 0.001,
+                "GPU timer exceeds its enclosing command buffer duration");
             require(f.words[0] == delayMs, "GPU timer completion preceded its recorded write");
             f.device->runGarbageCollection();
         }
@@ -464,6 +470,101 @@ namespace
             bytes->GetBufferPointer(), bytes->GetBufferSize());
         require(shader != nullptr, "Indirect regression shader creation failed");
         return shader;
+    }
+
+    void sparseDescriptorSnapshots()
+    {
+        Fixture f;
+        nvrhi::RefCountPtr<IDxcCompiler3> compiler;
+        require(SUCCEEDED(DxcCreateInstance(CLSID_DxcCompiler, IID_PPV_ARGS(compiler.GetAddressOf()))),
+            "DXC compiler creation failed");
+        const char* source =
+            "Texture2D<float4> textures[] : register(t0, space1);"
+            "RWByteAddressBuffer output : register(u0);"
+            "[numthreads(1, 1, 1)] void csMain() {"
+            "uint low = uint(textures[3].Load(int3(0, 0, 0)).r * 255);"
+            "uint high = uint(textures[65535].Load(int3(0, 0, 0)).g * 255);"
+            "output.Store(0, low | (high << 8)); }";
+        auto layout = f.device->createBindingLayout(nvrhi::BindingLayoutDesc()
+            .setVisibility(nvrhi::ShaderType::Compute)
+            .addItem(nvrhi::BindingLayoutItem::RawBuffer_UAV(0)));
+        nvrhi::BindlessLayoutDesc heapDesc;
+        heapDesc.visibility = nvrhi::ShaderType::All;
+        heapDesc.maxCapacity = 65536;
+        heapDesc.registerSpaces = {nvrhi::BindingLayoutItem::Texture_SRV(1)};
+        auto heapLayout = f.device->createBindlessLayout(heapDesc);
+        auto heap = f.device->createDescriptorTable(heapLayout);
+        require(layout != nullptr && heap != nullptr, "Sparse descriptor layout creation failed");
+        f.device->resizeDescriptorTable(heap, heapDesc.maxCapacity, false);
+        auto shader = compileRegressionShader(f.device, compiler, source, nvrhi::ShaderType::Compute);
+        auto pipeline = f.device->createComputePipeline(nvrhi::ComputePipelineDesc()
+            .setComputeShader(shader).addBindingLayout(layout).addBindingLayout(heapLayout));
+        require(pipeline != nullptr, "Sparse descriptor pipeline creation failed");
+        nvrhi::TextureDesc textureDesc;
+        textureDesc.width = textureDesc.height = 1;
+        textureDesc.format = nvrhi::Format::RGBA8_UNORM;
+        textureDesc.initialState = nvrhi::ResourceStates::ShaderResource;
+        textureDesc.keepInitialState = true;
+        std::array<nvrhi::TextureHandle, 3> textures;
+        const uint32_t texels[] = {0xff0000ffu, 0xff00ff00u, 0xffff0000u};
+        auto uploads = f.list();
+        uploads->open();
+        for (unsigned index = 0; index < textures.size(); ++index)
+        {
+            textures[index] = f.device->createTexture(textureDesc);
+            require(textures[index] != nullptr, "Sparse descriptor texture creation failed");
+            uploads->writeTexture(textures[index], 0, 0, &texels[index], sizeof(uint32_t));
+        }
+        uploads->close();
+        f.execute(uploads);
+        f.device->waitForIdle();
+        uploads = nullptr;
+        require(f.device->writeDescriptorTable(heap, nvrhi::BindingSetItem::Texture_SRV(3, textures[0])) &&
+            f.device->writeDescriptorTable(heap, nvrhi::BindingSetItem::Texture_SRV(65535, textures[1])),
+            "Sparse descriptor writes failed");
+        std::array<nvrhi::CommandListHandle, 2> commands;
+        std::array<nvrhi::BufferHandle, 2> outputs;
+        for (unsigned index = 0; index < commands.size(); ++index)
+        {
+            nvrhi::BufferDesc outputDesc;
+            outputDesc.byteSize = sizeof(uint32_t);
+            outputDesc.cpuAccess = nvrhi::CpuAccessMode::Read;
+            outputDesc.canHaveUAVs = outputDesc.canHaveRawViews = true;
+            outputDesc.initialState = nvrhi::ResourceStates::UnorderedAccess;
+            outputDesc.keepInitialState = true;
+            outputs[index] = f.device->createBuffer(outputDesc);
+            require(outputs[index] != nullptr, "Sparse descriptor output creation failed");
+            nvrhi::BindingSetDesc bindings;
+            bindings.bindings = {nvrhi::BindingSetItem::RawBuffer_UAV(0, outputs[index])};
+            auto set = f.device->createBindingSet(bindings, layout);
+            require(set != nullptr, "Sparse descriptor binding set creation failed");
+            commands[index] = f.list();
+            commands[index]->open();
+            nvrhi::ComputeState state;
+            state.pipeline = pipeline;
+            state.bindings = {set, heap};
+            commands[index]->setComputeState(state);
+            commands[index]->dispatch(1);
+            commands[index]->close();
+            if (index == 0)
+            {
+                require(f.device->writeDescriptorTable(heap, nvrhi::BindingSetItem::Texture_SRV(3, textures[2])) &&
+                    f.device->writeDescriptorTable(heap, nvrhi::BindingSetItem::Texture_SRV(65535, textures[2])),
+                    "Sparse descriptor replacement failed");
+                textures[0] = textures[1] = nullptr;
+            }
+        }
+        nvrhi::ICommandList* reversed[] = {commands[1], commands[0]};
+        require(f.device->executeCommandLists(reversed, 2) != 0, "Sparse descriptor submission failed");
+        f.device->waitForIdle();
+        for (unsigned index = 0; index < outputs.size(); ++index)
+        {
+            id<MTLBuffer> native = (__bridge id<MTLBuffer>)
+                outputs[index]->getNativeObject(nvrhi::ObjectTypes::MTL3_Buffer).pointer;
+            require(*static_cast<const uint32_t*>(native.contents) == (index == 0 ? 0xffffu : 0u),
+                "Sparse descriptor indices or recorded snapshot contents changed");
+        }
+        f.checkErrors();
     }
 
     void interruptedIndirectDraws()
@@ -1040,6 +1141,7 @@ int main()
             timerQueries();
             reusedTimerQueriesAcrossGpuWaits();
             mixedTimerQueries();
+            sparseDescriptorSnapshots();
             interruptedIndirectDraws();
             countedIndirectBindings();
             unsupportedCapabilities();

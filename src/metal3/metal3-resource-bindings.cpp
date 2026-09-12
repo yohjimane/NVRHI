@@ -415,12 +415,16 @@ namespace nvrhi::metal3
             context.error("[nvrhi] Failed to allocate Metal descriptor table.");
             return nullptr;
         }
-        result->entries = entries;
+        result->entries.reserve(std::count_if(entries.begin(), entries.end(),
+            [](const MetalBindingResource& entry) { return entry.resource != nullptr; }));
         auto* encoded = static_cast<IRDescriptorTableEntry*>(result->buffer.contents);
         std::memset(encoded, 0, entries.size() * sizeof(IRDescriptorTableEntry));
         for (size_t index = 0; index < entries.size(); ++index)
             if (entries[index].resource)
+            {
                 encodeMetalBindingResource(encoded + index, entries[index]);
+                result->entries.push_back(entries[index]);
+            }
         snapshot = result;
         return result;
     }

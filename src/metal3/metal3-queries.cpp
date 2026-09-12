@@ -24,14 +24,11 @@ namespace nvrhi::metal3
         {
             const auto& pool = m_TimerQueryPool;
             std::lock_guard<std::mutex> lock(pool->mutex);
-            if (!pool->frequency)
+            if (!pool->markerPipeline)
             {
-                uint64_t frequency = 0;
-                if (@available(macOS 26.0, *))
-                    frequency = [m_Context.device queryTimestampFrequency];
-                if (!frequency || ![m_Context.device supportsCounterSampling:MTLCounterSamplingPointAtStageBoundary])
+                if (![m_Context.device supportsCounterSampling:MTLCounterSamplingPointAtStageBoundary])
                 {
-                    m_Context.error("[nvrhi] Native GPU timer queries require timestamp frequency and encoder-boundary sampling support.");
+                    m_Context.error("[nvrhi] Native GPU timer queries require encoder-boundary sampling support.");
                     return nullptr;
                 }
                 for (id<MTLCounterSet> counterSet in m_Context.device.counterSets)
@@ -62,7 +59,7 @@ namespace nvrhi::metal3
                     return nullptr;
                 }
                 pool->markerPipeline = pipeline;
-                pool->frequency = frequency;
+                pool->timestampsInNanoseconds = [m_Context.device supportsFamily:MTLGPUFamilyApple1];
             }
             size_t pageIndex = 0;
             size_t emptyPageIndex = pool->pages.size();
@@ -115,7 +112,6 @@ namespace nvrhi::metal3
             page.freeSamples.pop_back();
             query->samples = page.samples;
             query->markers = page.markers;
-            query->frequency = pool->frequency;
             return TimerQueryHandle::Create(query);
         }
     }
@@ -155,8 +151,21 @@ namespace nvrhi::metal3
                     return std::numeric_limits<float>::quiet_NaN();
                 }
             }
-            return float(double(values[TimerQueryPool::SamplesPerQuery - 1].timestamp - values[0].timestamp) /
-                double(query->frequency));
+            double elapsed = double(values[TimerQueryPool::SamplesPerQuery - 1].timestamp - values[0].timestamp);
+            if (!query->pool->timestampsInNanoseconds)
+            {
+                MTLTimestamp cpuTimestamp = 0;
+                MTLTimestamp gpuTimestamp = 0;
+                [m_Context.device sampleTimestamps:&cpuTimestamp gpuTimestamp:&gpuTimestamp];
+                if (cpuTimestamp <= query->cpuStartTimestamp || gpuTimestamp <= query->gpuStartTimestamp)
+                {
+                    m_Context.error("[nvrhi] Cannot calibrate GPU timestamp samples.");
+                    return std::numeric_limits<float>::quiet_NaN();
+                }
+                elapsed *= double(cpuTimestamp - query->cpuStartTimestamp) /
+                    double(gpuTimestamp - query->gpuStartTimestamp);
+            }
+            return float(elapsed * 1e-9);
         }
     }
 
@@ -210,6 +219,8 @@ namespace nvrhi::metal3
             m_Context.error("[nvrhi] GPU timer begin requires an open command list and an unused query.");
             return;
         }
+        if (!query->pool->timestampsInNanoseconds)
+            [m_Context.device sampleTimestamps:&query->cpuStartTimestamp gpuTimestamp:&query->gpuStartTimestamp];
         if (!encodeTimerBoundary(query, false))
             return;
         query->commandBuffer = trackedCmdBuffer;
