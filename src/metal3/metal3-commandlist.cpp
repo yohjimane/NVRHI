@@ -1261,11 +1261,6 @@ namespace nvrhi::metal3
         m_ActiveSerial = ++m_SubmittedSerial;
         m_CurrentChunk = size_t(-1);
     }
-    /*
-     * called from CommandList::close() before commit.
-     * It attaches a Metal completion handler: `[commandBuffer addCompletedHandler:...]`
-     * When the GPU finishes this command buffer, it updates: `m_CompletedSerial = submittedSerial;`
-    */
     void UploadManager::submitCommandBuffer(id<MTLCommandBuffer> commandBuffer)
     {
         if (!commandBuffer || m_ActiveSerial == 0)
@@ -1281,6 +1276,24 @@ namespace nvrhi::metal3
             {
             }
         }];
+        m_ActiveSerial = 0;
+        m_CurrentChunk = size_t(-1);
+    }
+
+    void UploadManager::discardCommandBuffer()
+    {
+        if (m_ActiveSerial == 0)
+            return;
+        for (Chunk& chunk : m_Chunks)
+        {
+            if (chunk.lastUsedSerial == m_ActiveSerial)
+            {
+                chunk.lastUsedSerial = 0;
+                chunk.offset = 0;
+            }
+        }
+        m_ActiveSerial = 0;
+        m_CurrentChunk = size_t(-1);
     }
 
     /*
@@ -1418,6 +1431,16 @@ namespace nvrhi::metal3
                 state->slots[slotIndex].inFlight = false;
         }];
         m_ActiveSlot = size_t(-1);
+    }
+
+    void TransientIndirectResourcePool::discardCommandBuffer()
+    {
+        std::lock_guard<std::mutex> lock(m_State->mutex);
+        if (m_ActiveSlot != size_t(-1))
+        {
+            m_State->slots[m_ActiveSlot].inFlight = false;
+            m_ActiveSlot = size_t(-1);
+        }
     }
 
     TransientIndirectResourcePool::Stats TransientIndirectResourcePool::getActiveStats() const
@@ -1585,7 +1608,17 @@ namespace nvrhi::metal3
             , m_TransientIndirectResources(context)
             , m_Desc(params) {}
         
-    CommandList::~CommandList() {};
+    CommandList::~CommandList()
+    {
+        std::lock_guard<std::mutex> lock(m_Device->m_Mutex);
+        endEncoding();
+        if (m_Device->m_OpenImmediateCommandList == this)
+            m_Device->m_OpenImmediateCommandList = nullptr;
+        trackedCmdBuffer = nil;
+        m_UploadManager.discardCommandBuffer();
+        m_ArgumentTableManager.discardCommandBuffer();
+        m_TransientIndirectResources.discardCommandBuffer();
+    }
 
     Object CommandList::getNativeObject(ObjectType objectType)
     {
@@ -1687,9 +1720,36 @@ namespace nvrhi::metal3
 #endif
     }
 
-    // crates a new command buffer, invalidates compute and graphics state, and the encoders
     void CommandList::open()
     {
+        std::lock_guard<std::mutex> lock(m_Device->m_Mutex);
+        if (m_RecordingState == RecordingState::Open)
+        {
+            m_Context.error("[nvrhi] Cannot open an already open Metal command list.");
+            return;
+        }
+        if (m_Desc.enableImmediateExecution &&
+            (m_RecordingState == RecordingState::Closed || m_Device->m_OpenImmediateCommandList))
+        {
+            m_Context.error("[nvrhi] Immediate Metal command lists must be executed before reopening and cannot be recorded concurrently.");
+            return;
+        }
+
+        trackedCmdBuffer = nil;
+        m_UploadManager.discardCommandBuffer();
+        m_ArgumentTableManager.discardCommandBuffer();
+        m_TransientIndirectResources.discardCommandBuffer();
+        m_RecordingState = RecordingState::Initial;
+        trackedCmdBuffer = [m_Context.commonQueue commandBuffer];
+        if (!trackedCmdBuffer)
+        {
+            m_Context.error("[nvrhi] Failed to allocate a Metal command buffer.");
+            return;
+        }
+        m_RecordingState = RecordingState::Open;
+        if (m_Desc.enableImmediateExecution)
+            m_Device->m_OpenImmediateCommandList = this;
+
         m_ReferencedBindingSets.clear();
         m_ReferencedNativeBuffers.clear();
         m_ReferencedNativeResources.clear();
@@ -1700,7 +1760,6 @@ namespace nvrhi::metal3
         m_ArgumentTableAllocationCount = 0;
         m_ArgumentTablePageCountAtOpen = m_ArgumentTableManager.getChunkCount();
         m_VolatileBufferAllocations.clear();
-        trackedCmdBuffer = [m_Context.commonQueue commandBuffer];
         m_CurrentGraphicsStateValid = false;
         m_CurrentComputeStateValid = false;
         m_GeometryEmulationDrawStateValid = false;
@@ -1709,12 +1768,18 @@ namespace nvrhi::metal3
         m_RenderEncoder = nil;
         m_ComputeEncoder = nil;
     }
-    // closing it commits the command buffer to queue, and invalidates the encoders, command buffers
     void CommandList::close()
     {
+        std::lock_guard<std::mutex> lock(m_Device->m_Mutex);
+        if (m_RecordingState != RecordingState::Open)
+        {
+            m_Context.error("[nvrhi] Cannot close a Metal command list that is not open.");
+            return;
+        }
         endEncoding();
-        m_UploadManager.submitCommandBuffer(trackedCmdBuffer);
-        m_ArgumentTableManager.submitCommandBuffer(trackedCmdBuffer);
+        m_RecordingState = RecordingState::Closed;
+        if (m_Device->m_OpenImmediateCommandList == this)
+            m_Device->m_OpenImmediateCommandList = nullptr;
         if (indirectResourceStatsEnabled())
         {
             const TransientIndirectResourcePool::Stats stats = m_TransientIndirectResources.getActiveStats();
@@ -1728,7 +1793,6 @@ namespace nvrhi::metal3
                 " icbs_created=" + std::to_string(stats.indirectCommandBuffersCreated) +
                 " overflow_slot=" + std::to_string(stats.usedOverflowSlot ? 1 : 0));
         }
-        m_TransientIndirectResources.submitCommandBuffer(trackedCmdBuffer);
         if (argumentTableStatsEnabled())
         {
             const size_t pageCount = m_ArgumentTableManager.getChunkCount();
@@ -1737,7 +1801,15 @@ namespace nvrhi::metal3
                 " pages=" + std::to_string(pageCount) +
                 " new_pages=" + std::to_string(pageCount - m_ArgumentTablePageCountAtOpen));
         }
+    }
+
+    void CommandList::submit()
+    {
+        m_UploadManager.submitCommandBuffer(trackedCmdBuffer);
+        m_ArgumentTableManager.submitCommandBuffer(trackedCmdBuffer);
+        m_TransientIndirectResources.submitCommandBuffer(trackedCmdBuffer);
         [trackedCmdBuffer commit];
+        m_RecordingState = RecordingState::Submitted;
     }
 
     void CommandList::clearState()

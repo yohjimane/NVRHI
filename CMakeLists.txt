@@ -43,6 +43,7 @@ cmake_dependent_option(NVRHI_WITH_DX11 "Build the NVRHI D3D11 backend" ON "WIN32
 cmake_dependent_option(NVRHI_WITH_DX12 "Build the NVRHI D3D12 backend" ON "WIN32" OFF)
 option(NVRHI_WITH_METAL3 "Build the NVRHI Metal 3 backend" OFF)
 cmake_dependent_option(NVRHI_METAL3_WITH_TRACY "Enable Tracy GPU timestamp instrumentation in the Metal 3 backend" OFF "NVRHI_WITH_METAL3" OFF)
+cmake_dependent_option(NVRHI_METAL3_BUILD_TESTS "Build native Metal command-list contract tests" OFF "NVRHI_WITH_METAL3" OFF)
 
 
 if(NVRHI_WITH_VULKAN)
@@ -537,6 +538,19 @@ if (NVRHI_WITH_METAL3)
         endif()
         target_link_libraries(${nvrhi_metal3_target} PRIVATE Tracy::TracyClient)
         target_compile_definitions(${nvrhi_metal3_target} PRIVATE NVRHI_METAL3_WITH_TRACY=1)
+    endif()
+
+    if(NVRHI_METAL3_BUILD_TESTS)
+        enable_testing()
+        add_executable(nvrhi_metal3_commandlist_tests tests/metal3-commandlist.mm)
+        target_compile_features(nvrhi_metal3_commandlist_tests PRIVATE cxx_std_17)
+        target_compile_options(nvrhi_metal3_commandlist_tests PRIVATE -fobjc-arc)
+        target_link_libraries(nvrhi_metal3_commandlist_tests PRIVATE nvrhi)
+        if(NOT NVRHI_BUILD_SHARED)
+            target_link_libraries(nvrhi_metal3_commandlist_tests PRIVATE nvrhi_metal3)
+        endif()
+        add_test(NAME nvrhi_metal3_commandlist COMMAND nvrhi_metal3_commandlist_tests)
+        set_tests_properties(nvrhi_metal3_commandlist PROPERTIES TIMEOUT 30 ENVIRONMENT "MTL_DEBUG_LAYER=1")
     endif()
 endif()
 

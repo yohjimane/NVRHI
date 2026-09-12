@@ -513,16 +513,63 @@ namespace nvrhi::metal3
 
     nvrhi::CommandListHandle Device::createCommandList(const CommandListParameters& params)
     {
+        if (uint32_t(params.queueType) >= uint32_t(CommandQueue::Count))
+        {
+            m_Context.error("[nvrhi] Invalid Metal command-list queue type.");
+            return nullptr;
+        }
+        if (params.lifetimeTracker)
+        {
+            m_Context.error("[nvrhi] External Metal command-list lifetime trackers are not supported.");
+            return nullptr;
+        }
         return nvrhi::CommandListHandle::Create(new CommandList(this, m_Context, params));
     }
 
     uint64_t Device::executeCommandLists(nvrhi::ICommandList* const* pCommandLists, size_t numCommandLists, CommandQueue executionQueue)
     {
-        (void)pCommandLists;
-        (void)numCommandLists;
-        (void)executionQueue;
-        static std::atomic<uint64_t> serial{1};
-        return serial.fetch_add(1, std::memory_order_relaxed);
+        if (numCommandLists == 0)
+            return 0;
+        if (!pCommandLists || uint32_t(executionQueue) >= uint32_t(CommandQueue::Count))
+        {
+            m_Context.error("[nvrhi] Invalid Metal command-list submission array or queue.");
+            return 0;
+        }
+
+        std::lock_guard<std::mutex> lock(m_Mutex);
+        size_t prepared = 0;
+        for (; prepared < numCommandLists; ++prepared)
+        {
+            nvrhi::ICommandList* list = pCommandLists[prepared];
+            auto* commandList = list ? static_cast<CommandList*>(
+                list->getNativeObject(ObjectTypes::Nvrhi_Metal3_CommandList).pointer) : nullptr;
+            if (!commandList || commandList->m_Device != this
+                || commandList->m_Desc.queueType != executionQueue
+                || commandList->m_RecordingState != CommandList::RecordingState::Closed
+                || commandList->trackedCmdBuffer.status != MTLCommandBufferStatusNotEnqueued)
+                break;
+            commandList->m_RecordingState = CommandList::RecordingState::PendingSubmission;
+        }
+
+        if (prepared != numCommandLists)
+        {
+            for (size_t index = 0; index < prepared; ++index)
+            {
+                auto* commandList = static_cast<CommandList*>(
+                    pCommandLists[index]->getNativeObject(ObjectTypes::Nvrhi_Metal3_CommandList).pointer);
+                commandList->m_RecordingState = CommandList::RecordingState::Closed;
+            }
+            m_Context.error("[nvrhi] Metal submission requires unique, closed, unsubmitted command lists from this device and queue.");
+            return 0;
+        }
+
+        for (size_t index = 0; index < numCommandLists; ++index)
+        {
+            auto* commandList = static_cast<CommandList*>(
+                pCommandLists[index]->getNativeObject(ObjectTypes::Nvrhi_Metal3_CommandList).pointer);
+            commandList->submit();
+        }
+        return ++m_SubmissionSerial;
     }
 
     void Device::queueWaitForCommandList(CommandQueue waitQueue, CommandQueue executionQueue, uint64_t instance)

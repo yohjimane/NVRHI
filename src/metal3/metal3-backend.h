@@ -197,6 +197,7 @@ namespace nvrhi::metal3
             size_t initialChunkCount = 0);
         void beginCommandBuffer();
         void submitCommandBuffer(id<MTLCommandBuffer> commandBuffer);
+        void discardCommandBuffer();
         UploadAllocation suballocate(size_t size, size_t alignment);
         size_t getChunkCount() const { return m_Chunks.size(); }
 
@@ -251,6 +252,7 @@ namespace nvrhi::metal3
         explicit TransientIndirectResourcePool(const MTL3Context& context);
         void beginCommandBuffer();
         void submitCommandBuffer(id<MTLCommandBuffer> commandBuffer);
+        void discardCommandBuffer();
         Stats getActiveStats() const;
         TransientBufferAllocation allocateShared(NSUInteger size, NSUInteger alignment = 256);
         TransientBufferAllocation allocatePrivate(NSUInteger size, NSUInteger alignment = 256);
@@ -633,6 +635,20 @@ namespace nvrhi::metal3
         void setTracyGpuScope(const char* name, const char* file, const char* function, uint32_t line, void* context) override;
         void clearTracyGpuScope() override;
     private:
+        friend class Device;
+
+        enum class RecordingState
+        {
+            Initial,
+            Open,
+            Closed,
+            PendingSubmission,
+            Submitted
+        };
+
+        RecordingState m_RecordingState = RecordingState::Initial;
+        void submit();
+
         struct TracyGpuScopeDesc
         {
             const char* name = nullptr;
@@ -644,7 +660,7 @@ namespace nvrhi::metal3
         };
         const MTL3Context& m_Context;
 
-        IDevice* m_Device;
+        Device* m_Device;
         
         // i can prolly have Queue struct and pointer to object here
         // but its not really needed, and neither does metal 3 demand it.
@@ -677,9 +693,7 @@ namespace nvrhi::metal3
 
         // Cache for internal state
 
-        // not really tracked, cuz metal buffers expire once they commit
-        // kept for convenience (TODO?)
-        id<MTLCommandBuffer> trackedCmdBuffer;
+        id<MTLCommandBuffer> trackedCmdBuffer = nil;
         id<MTLRenderCommandEncoder> m_RenderEncoder = nil;
         id<MTLComputeCommandEncoder> m_ComputeEncoder = nil;
 
@@ -861,6 +875,11 @@ namespace nvrhi::metal3
         // TODO: metal.h virtual funs implementation if any
         
     private:
+        friend class CommandList;
+
+        uint64_t m_SubmissionSerial = 0;
+        CommandList* m_OpenImmediateCommandList = nullptr;
+
         bool m_AftermathEnabled;
         AftermathCrashDumpHelper m_AftermathCrashDumpHelper;
 
