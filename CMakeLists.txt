@@ -41,7 +41,7 @@ option(NVRHI_WITH_AFTERMATH "Include Aftermath support (requires NSight Aftermat
 cmake_dependent_option(NVRHI_WITH_NVAPI "Include NVAPI support (requires NVAPI SDK)" OFF "WIN32" OFF)
 cmake_dependent_option(NVRHI_WITH_DX11 "Build the NVRHI D3D11 backend" ON "WIN32" OFF)
 cmake_dependent_option(NVRHI_WITH_DX12 "Build the NVRHI D3D12 backend" ON "WIN32" OFF)
-cmake_dependent_option(NVRHI_WITH_METAL3 "Build the NVRHI Metal 3 backend" ON "APPLE" OFF)
+option(NVRHI_WITH_METAL3 "Build the NVRHI Metal 3 backend" OFF)
 cmake_dependent_option(NVRHI_METAL3_WITH_TRACY "Enable Tracy GPU timestamp instrumentation in the Metal 3 backend" OFF "NVRHI_WITH_METAL3" OFF)
 
 
@@ -61,6 +61,9 @@ if(NVRHI_WITH_DX12)
 endif()
 
 if(NVRHI_WITH_METAL3)
+    if(NOT APPLE)
+        message(FATAL_ERROR "NVRHI_WITH_METAL3 requires an Apple platform and a Metal-capable SDK.")
+    endif()
     enable_language(OBJCXX)
 endif()
 if(NVRHI_WITH_RTXMU)
@@ -490,12 +493,31 @@ if (NVRHI_WITH_METAL3)
     find_library(NVRHI_METAL_FRAMEWORK Metal REQUIRED)
     find_library(NVRHI_FOUNDATION_FRAMEWORK Foundation REQUIRED)
     find_library(NVRHI_QUARTZCORE_FRAMEWORK QuartzCore REQUIRED)
+    set(NVRHI_METAL_SHADER_CONVERTER_ROOT "" CACHE PATH "Metal Shader Converter SDK prefix")
     find_path(NVRHI_METAL_IRCONVERTER_RUNTIME_INCLUDE_DIR
         NAMES metal_irconverter_runtime/metal_irconverter_runtime.h
-        PATHS
-            /usr/local/include
-            /opt/homebrew/include
-        REQUIRED)
+        HINTS "${NVRHI_METAL_SHADER_CONVERTER_ROOT}"
+        PATHS /usr/local /opt/homebrew
+        PATH_SUFFIXES include)
+    if(NOT EXISTS "${NVRHI_METAL_IRCONVERTER_RUNTIME_INCLUDE_DIR}/metal_irconverter_runtime/metal_irconverter_runtime.h")
+        message(FATAL_ERROR
+            "The native Metal backend requires Apple's Metal Shader Converter runtime headers.\n"
+            "Set NVRHI_METAL_SHADER_CONVERTER_ROOT to the SDK prefix containing include/, "
+            "or set NVRHI_METAL_IRCONVERTER_RUNTIME_INCLUDE_DIR to the include directory "
+            "containing metal_irconverter_runtime/metal_irconverter_runtime.h.\n"
+            "Download the SDK from https://developer.apple.com/metal/shader-converter/ "
+            "(Apple Account sign-in required). No SDK is downloaded automatically.")
+    endif()
+    find_program(NVRHI_METAL_SHADER_CONVERTER_EXECUTABLE
+        NAMES metal-shaderconverter
+        HINTS "${NVRHI_METAL_SHADER_CONVERTER_ROOT}"
+        PATH_SUFFIXES bin)
+    message(STATUS "Metal Shader Converter runtime: ${NVRHI_METAL_IRCONVERTER_RUNTIME_INCLUDE_DIR}")
+    if(NVRHI_METAL_SHADER_CONVERTER_EXECUTABLE)
+        message(STATUS "Metal Shader Converter tool: ${NVRHI_METAL_SHADER_CONVERTER_EXECUTABLE}")
+    else()
+        message(STATUS "Metal Shader Converter tool not found; shader conversion requires a separate tool installation.")
+    endif()
 
     set_source_files_properties(${src_metal3_impl} PROPERTIES LANGUAGE OBJCXX)
     target_compile_features(${nvrhi_metal3_target} PRIVATE cxx_std_17)

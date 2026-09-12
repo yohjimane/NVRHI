@@ -100,9 +100,13 @@ namespace nvrhi::metal3
         return nullptr;
     }
 
-    Object Texture::getNativeView(ObjectType objectType, Format format, TextureSubresourceSet subresources, TextureDimension dimension, bool isReadOnlyDSV)
+    Object Texture::getNativeView(ObjectType objectType, Format format, TextureSubresourceSet subresources, TextureDimension dimension, bool, std::optional<ComponentMapping> overrideComponentMapping)
     {
-        (void)format; (void)subresources; (void)dimension; (void)isReadOnlyDSV;
+        if ((format != Format::UNKNOWN && format != desc.format)
+            || !subresources.isEntireTexture(desc)
+            || (dimension != TextureDimension::Unknown && dimension != desc.dimension)
+            || !resolveComponentMapping(overrideComponentMapping, desc.defaultComponentMapping).isIdentity())
+            return nullptr;
         return getNativeObject(objectType);
     }
 }
