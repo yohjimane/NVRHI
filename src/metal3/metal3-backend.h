@@ -521,16 +521,19 @@ namespace nvrhi::metal3
     struct TimerQueryPool
     {
         static constexpr NSUInteger QueriesPerPage = 256;
+        static constexpr NSUInteger SamplesPerQuery = 4;
 
         struct Page
         {
             id<MTLCounterSampleBuffer> samples = nil;
+            id<MTLBuffer> markers = nil;
             std::vector<NSUInteger> freeSamples;
         };
 
         std::mutex mutex;
         std::vector<Page> pages;
         id<MTLCounterSet> counterSet = nil;
+        id<MTLComputePipelineState> markerPipeline = nil;
         uint64_t frequency = 0;
     };
 
@@ -542,6 +545,7 @@ namespace nvrhi::metal3
         size_t pageIndex = 0;
         NSUInteger sampleIndex = 0;
         id<MTLCounterSampleBuffer> samples = nil;
+        id<MTLBuffer> markers = nil;
         id<MTLCommandBuffer> commandBuffer = nil;
         bool started = false;
         bool ended = false;
@@ -749,6 +753,14 @@ namespace nvrhi::metal3
         id<MTLBuffer> m_GeometryEmulationVertexBuffers = nil;
         NSUInteger m_GeometryEmulationVertexBuffersOffset = 0;
 
+        struct GraphicsBufferBinding
+        {
+            __unsafe_unretained id<MTLBuffer> buffer = nil;
+            NSUInteger offset = 0;
+        };
+        std::array<GraphicsBufferBinding, 31> m_VertexBufferBindings{};
+        std::array<GraphicsBufferBinding, 31> m_FragmentBufferBindings{};
+
         bool m_BindingStatesDirty = false;
 
         // Cache for internal state
@@ -770,6 +782,7 @@ namespace nvrhi::metal3
         std::array<uint8_t, c_MaxPushConstantSize> m_PushConstants{};
         size_t m_PushConstantSize = 0;
         std::unordered_map<Buffer*, VolatileBufferAllocation> m_VolatileBufferAllocations;
+        std::vector<NSString*> m_DebugGroups;
 
         TracyGpuScopeDesc m_TracyGpuScope;
 #if defined(NVRHI_METAL3_WITH_TRACY) && defined(TRACY_ENABLE)
@@ -778,6 +791,10 @@ namespace nvrhi::metal3
 #endif
 
         void endEncoding();
+        void annotateEncoder(id<MTLCommandEncoder> encoder, const char* operation);
+        bool encodeTimerBoundary(TimerQuery* query, bool ending);
+        void bindGraphicsBuffer(id<MTLRenderCommandEncoder> encoder, id<MTLBuffer> buffer,
+            NSUInteger offset, NSUInteger index, MTLRenderStages stages);
         id<MTLRenderCommandEncoder> getOrCreateRenderEncoder();
         id<MTLComputeCommandEncoder> getOrCreateComputeEncoder();
         ArgumentTableAllocation getOrCreateArgumentTable(const MetalStageBindingPlan& plan, const BindingSetVector& bindingSets);
@@ -964,6 +981,7 @@ namespace nvrhi::metal3
         std::shared_ptr<TimerQueryPool> m_TimerQueryPool = std::make_shared<TimerQueryPool>();
 
         CommandList* m_OpenImmediateCommandList = nullptr;
+        bool m_CommandBufferConfigurationReported = false;
 
         bool m_AftermathEnabled;
         AftermathCrashDumpHelper m_AftermathCrashDumpHelper;

@@ -1,10 +1,18 @@
 #include <nvrhi/metal3.h>
 #include <nvrhi/common/resource.h>
 #include <atomic>
+#include <array>
 #include <thread>
+#include <chrono>
 #include <cstdio>
 #include <cmath>
 #include <stdexcept>
+#include <cstring>
+#pragma push_macro("BOOL")
+#undef BOOL
+#define BOOL MetalDxcBOOL
+#include <dxcapi.h>
+#pragma pop_macro("BOOL")
 
 namespace
 {
@@ -234,6 +242,539 @@ namespace
         ~Gate() { event.signaledValue = 1; }
     };
 
+    void timerQueries()
+    {
+        Fixture f;
+        std::array<nvrhi::TimerQueryHandle, 260> queries;
+        for (auto& query : queries)
+        {
+            query = f.device->createTimerQuery();
+            require(query != nullptr, "GPU timer allocation failed");
+        }
+        auto commands = f.list();
+        for (unsigned cycle = 0; cycle < 3; ++cycle)
+        {
+            Gate gate(f.desc.pDevice);
+            id<MTLCommandBuffer> blocker = [f.desc.commonQueue commandBuffer];
+            [blocker encodeWaitForEvent:gate.event value:1];
+            [blocker commit];
+            commands->open();
+            for (unsigned index = 0; index < queries.size(); ++index)
+            {
+                auto& query = queries[index];
+                f.device->resetTimerQuery(query);
+                commands->beginTimerQuery(query);
+                const uint32_t value = cycle * 1000 + index;
+                if (index % 2)
+                    commands->writeBuffer(f.buffer, &value, sizeof(value), index * sizeof(value));
+                commands->endTimerQuery(query);
+            }
+            commands->close();
+            f.execute(commands);
+            require(!f.device->pollTimerQuery(queries.front()), "Blocked GPU timer completed early");
+            f.expectError([&] { f.device->resetTimerQuery(queries.front()); });
+            gate.event.signaledValue = 1;
+            f.device->waitForIdle();
+            Gate laterGate(f.desc.pDevice);
+            id<MTLCommandBuffer> laterBlocker = [f.desc.commonQueue commandBuffer];
+            [laterBlocker encodeWaitForEvent:laterGate.event value:1];
+            [laterBlocker commit];
+            auto later = f.list();
+            auto laterQuery = f.device->createTimerQuery();
+            later->open();
+            later->beginTimerQuery(laterQuery);
+            const uint32_t laterValue = 0x12345678;
+            later->writeBuffer(f.buffer, &laterValue, sizeof(laterValue), 1023 * sizeof(laterValue));
+            later->endTimerQuery(laterQuery);
+            later->close();
+            f.execute(later);
+            require(!f.device->pollTimerQuery(laterQuery), "Later GPU timer completed while blocked");
+            float elapsed = 0.f;
+            for (auto& query : queries)
+            {
+                require(f.device->pollTimerQuery(query), "Completed GPU timer remains unavailable");
+                const float duration = f.device->getTimerQueryTime(query);
+                require(std::isfinite(duration) && duration > 0.f, "GPU timer samples are missing or invalid");
+                elapsed += duration;
+            }
+            require(elapsed > 0.f && elapsed < 5.f, "GPU timer durations have invalid units");
+            laterGate.event.signaledValue = 1;
+            f.device->waitForIdle();
+            const float laterDuration = f.device->getTimerQueryTime(laterQuery);
+            require(std::isfinite(laterDuration) && laterDuration > 0.f, "Later GPU timer samples are missing or invalid");
+            require(f.words[259] == cycle * 1000 + 259 && f.words[1023] == laterValue,
+                "Timer instrumentation corrupted GPU work");
+            f.device->runGarbageCollection();
+        }
+        f.checkErrors();
+    }
+
+    void reusedTimerQueriesAcrossGpuWaits()
+    {
+        Fixture f;
+        auto query = f.device->createTimerQuery();
+        require(query != nullptr, "GPU timer allocation failed");
+        auto commands = f.list();
+        for (unsigned delayMs : {2u, 8u, 3u})
+        {
+            Gate started(f.desc.pDevice);
+            Gate release(f.desc.pDevice);
+            f.device->resetTimerQuery(query);
+            commands->open();
+            commands->beginTimerQuery(query);
+            auto native = static_cast<nvrhi::metal3::ICommandList*>(commands.Get())->getNativeCommandBuffer();
+            [native encodeSignalEvent:started.event value:1];
+            [native encodeWaitForEvent:release.event value:1];
+            commands->writeBuffer(f.buffer, &delayMs, sizeof(delayMs));
+            commands->endTimerQuery(query);
+            commands->close();
+            f.execute(commands);
+            auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+            while (started.event.signaledValue != 1)
+            {
+                require(std::chrono::steady_clock::now() < deadline, "GPU timer begin was not reached");
+                std::this_thread::yield();
+            }
+            require(!f.device->pollTimerQuery(query), "GPU timer reused a result before its end executed");
+            std::this_thread::sleep_for(std::chrono::milliseconds(delayMs));
+            release.event.signaledValue = 1;
+            deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+            while (!f.device->pollTimerQuery(query))
+            {
+                require(std::chrono::steady_clock::now() < deadline, "GPU timer end did not complete");
+                std::this_thread::yield();
+            }
+            const float elapsed = f.device->getTimerQueryTime(query);
+            require(std::isfinite(elapsed) && elapsed >= float(delayMs) * 0.001f && elapsed < 5.f,
+                "Reused GPU timer omitted its current GPU wait or returned stale samples");
+            require(f.words[0] == delayMs, "GPU timer completion preceded its recorded write");
+            f.device->runGarbageCollection();
+        }
+        f.checkErrors();
+    }
+
+    void mixedTimerQueries()
+    {
+        Fixture f;
+        NSError* error = nil;
+        NSString* source = @"#include <metal_stdlib>\n"
+            "using namespace metal;\n"
+            "kernel void work(device uint* words [[buffer(0)]], uint tid [[thread_position_in_grid]])"
+            "{ uint v = words[tid]; for (uint i = 0; i < 512; ++i) v = v * 1664525u + 1013904223u; words[tid] = v; }";
+        id<MTLLibrary> library = [f.desc.pDevice newLibraryWithSource:source options:nil error:&error];
+        require(library != nil, "Timer workload shader compilation failed");
+        id<MTLComputePipelineState> pipeline = [f.desc.pDevice
+            newComputePipelineStateWithFunction:[library newFunctionWithName:@"work"] error:&error];
+        require(pipeline != nil, "Timer workload pipeline creation failed");
+        nvrhi::TextureDesc desc;
+        desc.width = desc.height = 2048;
+        desc.format = nvrhi::Format::RGBA8_UNORM;
+        desc.isRenderTarget = true;
+        desc.initialState = nvrhi::ResourceStates::RenderTarget;
+        desc.keepInitialState = true;
+        auto texture = f.device->createTexture(desc);
+        require(texture != nullptr, "Timer workload render target creation failed");
+        std::array<std::array<nvrhi::TimerQueryHandle, 65>, 3> queries;
+        std::array<nvrhi::CommandListHandle, 3> commands;
+        for (unsigned frame = 0; frame < commands.size(); ++frame)
+        {
+            commands[frame] = f.list();
+            for (auto& query : queries[frame])
+            {
+                query = f.device->createTimerQuery();
+                require(query != nullptr, "Mixed workload timer allocation failed");
+            }
+        }
+        uint32_t expected = 0x55555555u;
+        for (unsigned cycle = 0; cycle < 3; ++cycle)
+        {
+            for (unsigned frame = 0; frame < commands.size(); ++frame)
+            {
+                auto& command = commands[frame];
+                command->open();
+                for (auto& query : queries[frame])
+                    f.device->resetTimerQuery(query);
+                command->beginTimerQuery(queries[frame][0]);
+                for (unsigned index = 1; index < queries[frame].size(); ++index)
+                {
+                    command->beginTimerQuery(queries[frame][index]);
+                    if (index % 3 == 0)
+                        command->clearTextureFloat(texture, nvrhi::AllSubresources, nvrhi::Color(0.25f));
+                    else if (index % 3 == 1)
+                    {
+                        auto native = static_cast<nvrhi::metal3::ICommandList*>(command.Get())->getNativeCommandBuffer();
+                        id<MTLComputeCommandEncoder> encoder = [native computeCommandEncoder];
+                        [encoder setComputePipelineState:pipeline];
+                        [encoder setBuffer:(__bridge id<MTLBuffer>)
+                            f.buffer->getNativeObject(nvrhi::ObjectTypes::MTL3_Buffer).pointer offset:0 atIndex:0];
+                        [encoder dispatchThreads:MTLSizeMake(1024, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+                        [encoder endEncoding];
+                        for (unsigned iteration = 0; iteration < 512; ++iteration)
+                            expected = expected * 1664525u + 1013904223u;
+                    }
+                    else
+                    {
+                        const uint32_t value = cycle + index;
+                        command->writeBuffer(f.buffer, &value, sizeof(value));
+                    }
+                    command->endTimerQuery(queries[frame][index]);
+                }
+                command->endTimerQuery(queries[frame][0]);
+                command->close();
+                f.execute(command);
+            }
+            f.device->waitForIdle();
+            for (const auto& frameQueries : queries)
+            {
+                const float outer = f.device->getTimerQueryTime(frameQueries[0]);
+                require(std::isfinite(outer) && outer > 0.f && outer < 5.f, "Outer GPU timer duration is invalid");
+                for (unsigned index = 1; index < frameQueries.size(); ++index)
+                {
+                    const float duration = f.device->getTimerQueryTime(frameQueries[index]);
+                    require(std::isfinite(duration) && duration > 0.f && duration <= outer,
+                        "Nested GPU timer is missing, invalid, or outside its enclosing interval");
+                }
+            }
+            for (unsigned index = 1; index < 1024; ++index)
+                require(f.words[index] == expected, "Mixed workload timer instrumentation corrupted compute results");
+            f.device->runGarbageCollection();
+        }
+        f.checkErrors();
+    }
+
+    nvrhi::ShaderHandle compileRegressionShader(nvrhi::IDevice* device, IDxcCompiler3* compiler,
+        const char* source, nvrhi::ShaderType type)
+    {
+        const char* entry = type == nvrhi::ShaderType::Vertex ? "vsMain"
+            : type == nvrhi::ShaderType::Pixel ? "psMain" : "csMain";
+        const wchar_t* wideEntry = type == nvrhi::ShaderType::Vertex ? L"vsMain"
+            : type == nvrhi::ShaderType::Pixel ? L"psMain" : L"csMain";
+        const wchar_t* profile = type == nvrhi::ShaderType::Vertex ? L"vs_6_6"
+            : type == nvrhi::ShaderType::Pixel ? L"ps_6_6" : L"cs_6_6";
+        DxcBuffer input{source, std::strlen(source), DXC_CP_UTF8};
+        const wchar_t* args[] = {L"-E", wideEntry, L"-T", profile};
+        nvrhi::RefCountPtr<IDxcResult> result;
+        require(SUCCEEDED(compiler->Compile(&input, args, 4, nullptr, IID_PPV_ARGS(result.GetAddressOf()))),
+            "Indirect regression shader compilation failed");
+        HRESULT status = E_FAIL;
+        require(SUCCEEDED(result->GetStatus(&status)) && SUCCEEDED(status), "Indirect regression shader is invalid");
+        nvrhi::RefCountPtr<IDxcBlob> bytes;
+        require(SUCCEEDED(result->GetResult(bytes.GetAddressOf())), "Indirect regression shader bytecode missing");
+        auto shader = device->createShader(nvrhi::ShaderDesc(type).setEntryName(entry),
+            bytes->GetBufferPointer(), bytes->GetBufferSize());
+        require(shader != nullptr, "Indirect regression shader creation failed");
+        return shader;
+    }
+
+    void interruptedIndirectDraws()
+    {
+        Fixture f;
+        nvrhi::RefCountPtr<IDxcCompiler3> compiler;
+        require(SUCCEEDED(DxcCreateInstance(CLSID_DxcCompiler, IID_PPV_ARGS(compiler.GetAddressOf()))),
+            "DXC compiler creation failed");
+        const char* source =
+            "float4 vsMain(uint id : SV_VertexID) : SV_Position {"
+            "float2 p = float2((id << 1) & 2, id & 2); return float4(p * 2 - 1, 0, 1); }"
+            "float4 psMain() : SV_Target { return float4(1, 0, 0, 1); }";
+        nvrhi::TextureDesc textureDesc;
+        textureDesc.width = 64;
+        textureDesc.height = 16;
+        textureDesc.format = nvrhi::Format::RGBA8_UNORM;
+        textureDesc.isRenderTarget = true;
+        textureDesc.initialState = nvrhi::ResourceStates::RenderTarget;
+        textureDesc.keepInitialState = true;
+        auto texture = f.device->createTexture(textureDesc);
+        auto framebuffer = f.device->createFramebuffer(nvrhi::FramebufferDesc().addColorAttachment(texture));
+        nvrhi::GraphicsPipelineDesc pipelineDesc;
+        pipelineDesc.VS = compileRegressionShader(f.device, compiler, source, nvrhi::ShaderType::Vertex);
+        pipelineDesc.PS = compileRegressionShader(f.device, compiler, source, nvrhi::ShaderType::Pixel);
+        pipelineDesc.renderState.depthStencilState.depthTestEnable = false;
+        pipelineDesc.renderState.depthStencilState.depthWriteEnable = false;
+        pipelineDesc.renderState.rasterState.cullMode = nvrhi::RasterCullMode::None;
+        auto pipeline = f.device->createGraphicsPipeline(pipelineDesc, framebuffer->getFramebufferInfo());
+        require(pipeline != nullptr, "Indirect regression pipeline creation failed");
+        nvrhi::BufferDesc bufferDesc;
+        bufferDesc.byteSize = 64;
+        bufferDesc.isDrawIndirectArgs = true;
+        bufferDesc.initialState = nvrhi::ResourceStates::IndirectArgument;
+        bufferDesc.keepInitialState = true;
+        auto arguments = f.device->createBuffer(bufferDesc);
+        bufferDesc.isDrawIndirectArgs = false;
+        bufferDesc.isIndexBuffer = true;
+        bufferDesc.initialState = nvrhi::ResourceStates::IndexBuffer;
+        auto indices = f.device->createBuffer(bufferDesc);
+        auto commands = f.list();
+        auto query = f.device->createTimerQuery();
+        for (bool indexed : {false, true})
+        {
+            for (unsigned interruption = 0; interruption < 3; ++interruption)
+            {
+                f.device->resetTimerQuery(query);
+                commands->open();
+                nvrhi::DrawIndirectArguments draw;
+                draw.vertexCount = 3;
+                nvrhi::DrawIndexedIndirectArguments indexedDraw;
+                indexedDraw.indexCount = 3;
+                if (indexed)
+                    commands->writeBuffer(arguments, &indexedDraw, sizeof(indexedDraw));
+                else
+                    commands->writeBuffer(arguments, &draw, sizeof(draw));
+                const uint32_t indexData[] = {0, 1, 2};
+                commands->writeBuffer(indices, indexData, sizeof(indexData));
+                commands->clearTextureFloat(texture, nvrhi::AllSubresources, nvrhi::Color(0.f));
+                nvrhi::GraphicsState state;
+                state.pipeline = pipeline;
+                state.framebuffer = framebuffer;
+                state.viewport.addViewport(nvrhi::Viewport(64.f, 16.f));
+                state.viewport.addScissorRect(nvrhi::Rect(0, 64, 0, 16));
+                state.indirectParams = arguments;
+                state.indexBuffer = {indices, nvrhi::Format::R32_UINT, 0};
+                commands->setGraphicsState(state);
+                if (interruption < 2)
+                {
+                    commands->beginTimerQuery(query);
+                    if (interruption == 1)
+                        commands->endTimerQuery(query);
+                }
+                else
+                    commands->writeBuffer(f.buffer, indexData, sizeof(indexData));
+                if (indexed)
+                    commands->drawIndexedIndirect(0, 1);
+                else
+                    commands->drawIndirect(0, 1);
+                if (interruption == 0)
+                    commands->endTimerQuery(query);
+                commands->setTextureState(texture, nvrhi::AllSubresources, nvrhi::ResourceStates::CopySource);
+                commands->commitBarriers();
+                auto native = static_cast<nvrhi::metal3::ICommandList*>(commands.Get())->getNativeCommandBuffer();
+                id<MTLBlitCommandEncoder> blit = [native blitCommandEncoder];
+                [blit copyFromTexture:(__bridge id<MTLTexture>)
+                    texture->getNativeObject(nvrhi::ObjectTypes::MTL3_Texture).pointer
+                    sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(64, 16, 1)
+                    toBuffer:(__bridge id<MTLBuffer>)f.buffer->getNativeObject(nvrhi::ObjectTypes::MTL3_Buffer).pointer
+                    destinationOffset:0 destinationBytesPerRow:256 destinationBytesPerImage:4096];
+                [blit endEncoding];
+                commands->close();
+                f.execute(commands);
+                f.device->waitForIdle();
+                for (unsigned pixel = 0; pixel < 1024; ++pixel)
+                    require(f.words[pixel] == 0xff0000ffu, "Indirect draw lost graphics state after encoder interruption");
+                if (interruption < 2)
+                    require(f.device->getTimerQueryTime(query) > 0.f, "Interrupted indirect draw timer is invalid");
+            }
+        }
+        f.checkErrors();
+    }
+
+    void countedIndirectBindings()
+    {
+        Fixture f;
+        nvrhi::RefCountPtr<IDxcCompiler3> compiler;
+        require(SUCCEEDED(DxcCreateInstance(CLSID_DxcCompiler, IID_PPV_ARGS(compiler.GetAddressOf()))),
+            "DXC compiler creation failed");
+        const char* source =
+            "cbuffer VertexConstants : register(b0) { float4 transform; };"
+            "cbuffer PixelConstants : register(b1) { float4 leftColor; float4 rightColor; };"
+            "Texture2D<float4> pattern : register(t0); SamplerState patternSampler : register(s0);"
+            "struct V { float4 p : SV_Position; nointerpolation uint instance : INSTANCE;"
+            "nointerpolation uint expected : EXPECTED; };"
+            "V vsMain(float2 position : POSITION, uint expected : TEXCOORD0, uint instance : INSTANCEINPUT) {"
+            "V v; v.p = float4(position * transform.xy + transform.zw, 0, 1);"
+            "v.instance = instance; v.expected = expected; return v; }"
+            "float4 psMain(V v) : SV_Target {"
+            "if (v.instance != v.expected) return float4(0, 0, 1, 1);"
+            "return (v.expected == 7 ? leftColor : rightColor)"
+            " * pattern.SampleLevel(patternSampler, float2(1.25, 0.5), 0); }";
+        const char* countSource =
+            "RWByteAddressBuffer count : register(u0);"
+            "[numthreads(1, 1, 1)] void csMain() { uint previous; count.InterlockedAdd(12, 1, previous); }";
+        auto graphicsLayout = f.device->createBindingLayout(nvrhi::BindingLayoutDesc()
+            .setVisibility(nvrhi::ShaderType::Vertex | nvrhi::ShaderType::Pixel)
+            .addItem(nvrhi::BindingLayoutItem::ConstantBuffer(0))
+            .addItem(nvrhi::BindingLayoutItem::ConstantBuffer(1))
+            .addItem(nvrhi::BindingLayoutItem::Texture_SRV(0))
+            .addItem(nvrhi::BindingLayoutItem::Sampler(0)));
+        auto computeLayout = f.device->createBindingLayout(nvrhi::BindingLayoutDesc()
+            .setVisibility(nvrhi::ShaderType::Compute)
+            .addItem(nvrhi::BindingLayoutItem::RawBuffer_UAV(0)));
+        require(graphicsLayout != nullptr && computeLayout != nullptr, "Counted indirect binding layout creation failed");
+        nvrhi::TextureDesc textureDesc;
+        textureDesc.width = 64;
+        textureDesc.height = 16;
+        textureDesc.format = nvrhi::Format::RGBA8_UNORM;
+        textureDesc.isRenderTarget = true;
+        textureDesc.initialState = nvrhi::ResourceStates::RenderTarget;
+        textureDesc.keepInitialState = true;
+        auto texture = f.device->createTexture(textureDesc);
+        auto framebuffer = f.device->createFramebuffer(nvrhi::FramebufferDesc().addColorAttachment(texture));
+        textureDesc.width = 2;
+        textureDesc.height = 1;
+        textureDesc.isRenderTarget = false;
+        textureDesc.initialState = nvrhi::ResourceStates::ShaderResource;
+        auto pattern = f.device->createTexture(textureDesc);
+        auto sampler = f.device->createSampler(nvrhi::SamplerDesc()
+            .setAllFilters(false).setAllAddressModes(nvrhi::SamplerAddressMode::Wrap));
+        require(texture != nullptr && framebuffer != nullptr && pattern != nullptr && sampler != nullptr,
+            "Counted indirect texture or sampler creation failed");
+        const nvrhi::VertexAttributeDesc attributes[] = {
+            nvrhi::VertexAttributeDesc().setName("POSITION").setFormat(nvrhi::Format::RG32_FLOAT)
+                .setOffset(0).setElementStride(12),
+            nvrhi::VertexAttributeDesc().setName("TEXCOORD").setFormat(nvrhi::Format::R32_UINT)
+                .setOffset(8).setElementStride(12),
+            nvrhi::VertexAttributeDesc().setName("INSTANCEINPUT").setFormat(nvrhi::Format::R32_UINT)
+                .setBufferIndex(1).setElementStride(sizeof(uint32_t)).setIsInstanced(true)
+        };
+        nvrhi::GraphicsPipelineDesc pipelineDesc;
+        pipelineDesc.VS = compileRegressionShader(f.device, compiler, source, nvrhi::ShaderType::Vertex);
+        pipelineDesc.PS = compileRegressionShader(f.device, compiler, source, nvrhi::ShaderType::Pixel);
+        pipelineDesc.inputLayout = f.device->createInputLayout(attributes, 3, pipelineDesc.VS);
+        require(pipelineDesc.inputLayout != nullptr, "Counted indirect input layout creation failed");
+        pipelineDesc.bindingLayouts.push_back(graphicsLayout);
+        pipelineDesc.renderState.depthStencilState.depthTestEnable = false;
+        pipelineDesc.renderState.depthStencilState.depthWriteEnable = false;
+        pipelineDesc.renderState.rasterState.cullMode = nvrhi::RasterCullMode::None;
+        auto pipeline = f.device->createGraphicsPipeline(pipelineDesc, framebuffer->getFramebufferInfo());
+        auto countShader = compileRegressionShader(f.device, compiler, countSource, nvrhi::ShaderType::Compute);
+        auto computePipeline = f.device->createComputePipeline(nvrhi::ComputePipelineDesc()
+            .setComputeShader(countShader).addBindingLayout(computeLayout));
+        require(pipeline != nullptr && computePipeline != nullptr, "Counted indirect pipeline creation failed");
+        nvrhi::BufferDesc argumentDesc;
+        argumentDesc.byteSize = 128;
+        argumentDesc.isDrawIndirectArgs = true;
+        argumentDesc.initialState = nvrhi::ResourceStates::IndirectArgument;
+        argumentDesc.keepInitialState = true;
+        auto arguments = f.device->createBuffer(argumentDesc);
+        nvrhi::BufferDesc countDesc = argumentDesc;
+        countDesc.byteSize = 16;
+        countDesc.canHaveUAVs = true;
+        countDesc.canHaveRawViews = true;
+        auto count = f.device->createBuffer(countDesc);
+        nvrhi::BufferDesc vertexDesc;
+        vertexDesc.byteSize = 16 + 8 * 12;
+        vertexDesc.isVertexBuffer = true;
+        vertexDesc.initialState = nvrhi::ResourceStates::VertexBuffer;
+        vertexDesc.keepInitialState = true;
+        auto vertices = f.device->createBuffer(vertexDesc);
+        vertexDesc.byteSize = 16 + 12 * sizeof(uint32_t);
+        auto instances = f.device->createBuffer(vertexDesc);
+        nvrhi::BufferDesc indexDesc;
+        indexDesc.byteSize = 16 + 12 * sizeof(uint32_t);
+        indexDesc.isIndexBuffer = true;
+        indexDesc.initialState = nvrhi::ResourceStates::IndexBuffer;
+        indexDesc.keepInitialState = true;
+        auto indices = f.device->createBuffer(indexDesc);
+        nvrhi::BufferDesc constantDesc;
+        constantDesc.byteSize = 16;
+        constantDesc.isConstantBuffer = true;
+        constantDesc.initialState = nvrhi::ResourceStates::ConstantBuffer;
+        constantDesc.keepInitialState = true;
+        auto vertexConstants = f.device->createBuffer(constantDesc);
+        constantDesc.byteSize = 32;
+        auto pixelConstants = f.device->createBuffer(constantDesc);
+        require(arguments != nullptr && count != nullptr && vertices != nullptr && instances != nullptr
+            && indices != nullptr && vertexConstants != nullptr && pixelConstants != nullptr,
+            "Counted indirect buffer creation failed");
+        nvrhi::BindingSetDesc graphicsBindings;
+        graphicsBindings.bindings = {
+            nvrhi::BindingSetItem::ConstantBuffer(0, vertexConstants),
+            nvrhi::BindingSetItem::ConstantBuffer(1, pixelConstants),
+            nvrhi::BindingSetItem::Texture_SRV(0, pattern),
+            nvrhi::BindingSetItem::Sampler(0, sampler)
+        };
+        auto graphicsSet = f.device->createBindingSet(graphicsBindings, graphicsLayout);
+        nvrhi::BindingSetDesc computeBindings;
+        computeBindings.bindings = {nvrhi::BindingSetItem::RawBuffer_UAV(0, count)};
+        auto computeSet = f.device->createBindingSet(computeBindings, computeLayout);
+        require(graphicsSet != nullptr && computeSet != nullptr, "Counted indirect binding set creation failed");
+        struct Vertex
+        {
+            float x, y;
+            uint32_t expectedInstance;
+        };
+        const Vertex vertexData[] = {
+            {-2.f, -2.f, 7}, {0.f, -2.f, 7}, {-2.f, 2.f, 7}, {0.f, 2.f, 7},
+            {0.f, -2.f, 11}, {2.f, -2.f, 11}, {0.f, 2.f, 11}, {2.f, 2.f, 11}
+        };
+        const uint32_t indexData[] = {0, 1, 2, 2, 1, 3, 0, 1, 2, 2, 1, 3};
+        const uint32_t instanceData[] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11};
+        const float transform[] = {0.5f, 0.5f, 0.f, 0.f};
+        const float colors[] = {1.f, 0.f, 0.f, 1.f, 0.f, 1.f, 0.f, 1.f};
+        const uint32_t texels[] = {0xffffffffu, 0xff000000u};
+        const nvrhi::DrawIndexedIndirectArguments draws[] = {
+            nvrhi::DrawIndexedIndirectArguments().setIndexCount(6).setStartInstanceLocation(7),
+            nvrhi::DrawIndexedIndirectArguments().setIndexCount(6).setStartIndexLocation(6)
+                .setBaseVertexLocation(4).setStartInstanceLocation(11),
+            nvrhi::DrawIndexedIndirectArguments().setIndexCount(6)
+        };
+        nvrhi::GraphicsState state;
+        state.pipeline = pipeline;
+        state.framebuffer = framebuffer;
+        state.viewport.addViewport(nvrhi::Viewport(64.f, 16.f));
+        state.viewport.addScissorRect(nvrhi::Rect(0, 64, 0, 16));
+        state.bindings.push_back(graphicsSet);
+        state.vertexBuffers.push_back({vertices, 0, 16});
+        state.vertexBuffers.push_back({instances, 1, 16});
+        state.indexBuffer = {indices, nvrhi::Format::R32_UINT, 16};
+        state.indirectParams = arguments;
+        state.indirectCountBuffer = count;
+        nvrhi::ComputeState computeState;
+        computeState.pipeline = computePipeline;
+        computeState.bindings.push_back(computeSet);
+        auto commands = f.list();
+        for (unsigned drawCount : {3u, 1u, 0u})
+        {
+            commands->open();
+            if (drawCount == 3)
+            {
+                commands->clearBufferUInt(arguments, 0);
+                commands->clearBufferUInt(vertices, 0);
+                commands->clearBufferUInt(instances, 0);
+                commands->clearBufferUInt(indices, 0);
+                commands->writeBuffer(arguments, draws, sizeof(draws), 16);
+                commands->writeBuffer(vertices, vertexData, sizeof(vertexData), 16);
+                commands->writeBuffer(instances, instanceData, sizeof(instanceData), 16);
+                commands->writeBuffer(indices, indexData, sizeof(indexData), 16);
+                commands->writeBuffer(vertexConstants, transform, sizeof(transform));
+                commands->writeBuffer(pixelConstants, colors, sizeof(colors));
+                commands->writeTexture(pattern, 0, 0, texels, sizeof(texels));
+            }
+            commands->clearBufferUInt(count, 0);
+            if (drawCount != 0)
+            {
+                commands->setComputeState(computeState);
+                commands->dispatch(drawCount, 1, 1);
+            }
+            commands->clearTextureFloat(texture, nvrhi::AllSubresources, nvrhi::Color(0.f));
+            commands->setGraphicsState(state);
+            commands->drawIndexedIndirectCount(16, 12, 2);
+            commands->setTextureState(texture, nvrhi::AllSubresources, nvrhi::ResourceStates::CopySource);
+            commands->commitBarriers();
+            auto native = static_cast<nvrhi::metal3::ICommandList*>(commands.Get())->getNativeCommandBuffer();
+            id<MTLBlitCommandEncoder> blit = [native blitCommandEncoder];
+            [blit copyFromTexture:(__bridge id<MTLTexture>)
+                texture->getNativeObject(nvrhi::ObjectTypes::MTL3_Texture).pointer
+                sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(64, 16, 1)
+                toBuffer:(__bridge id<MTLBuffer>)f.buffer->getNativeObject(nvrhi::ObjectTypes::MTL3_Buffer).pointer
+                destinationOffset:0 destinationBytesPerRow:256 destinationBytesPerImage:4096];
+            [blit endEncoding];
+            commands->close();
+            f.execute(commands);
+            require(f.device->waitForIdle(), "Counted indirect GPU submission failed");
+            for (unsigned y = 0; y < 16; ++y)
+            {
+                for (unsigned x = 0; x < 64; ++x)
+                {
+                    const uint32_t expected = drawCount == 0 ? 0u
+                        : x < 32 ? 0xff0000ffu : drawCount > 1 ? 0xff00ff00u : 0u;
+                    require(f.words[y * 64 + x] == expected,
+                        "Counted indirect draw lost per-command parameters, graphics bindings, or GPU count clipping");
+                }
+            }
+            f.device->runGarbageCollection();
+        }
+        f.checkErrors();
+    }
+
     void eventRearm()
     {
         Fixture f;
@@ -279,8 +820,7 @@ namespace
         texture.isUAV = false;
         texture.isRenderTarget = true;
         f.expectError([&] { require(f.device->createTexture(texture) == nullptr, "Compressed render target accepted"); });
-        f.expectError([&] { require(f.device->createTimerQuery() == nullptr, "Unimplemented timer returned a usable handle"); });
-        f.expectError([&] { require(std::isnan(f.device->getTimerQueryTime(nullptr)), "Unsupported timer returned a fabricated duration"); });
+        f.expectError([&] { require(std::isnan(f.device->getTimerQueryTime(nullptr)), "Invalid timer returned a fabricated duration"); });
         f.expectError([&] { require(f.device->createRayTracingPipeline({}) == nullptr, "Unimplemented ray tracing returned a usable pipeline"); });
         f.expectError([&] { require(f.device->createAccelStruct({}) == nullptr, "Unimplemented acceleration structure returned a usable handle"); });
         f.expectError([&] { require(f.device->createStagingTexture(texture, nvrhi::CpuAccessMode::Read) == nullptr, "Unimplemented staging texture accepted"); });
@@ -497,6 +1037,11 @@ int main()
             queueDependencies();
             simultaneousWaiters();
             lifetimeTrackers();
+            timerQueries();
+            reusedTimerQueriesAcrossGpuWaits();
+            mixedTimerQueries();
+            interruptedIndirectDraws();
+            countedIndirectBindings();
             unsupportedCapabilities();
             unsupportedRecording();
             std::puts("PASS: submission, event rearm, queue dependencies, concurrent waits, and lifetime tracking");

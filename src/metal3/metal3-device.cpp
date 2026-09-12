@@ -143,7 +143,34 @@ namespace nvrhi::metal3
                 {
                     queue.firstFailure = submitted.instance;
                     const char* message = submitted.commandBuffer.error.localizedDescription.UTF8String;
-                    m_Context.error(std::string("[nvrhi] Metal GPU submission failed: ") + (message ? message : "unknown error"));
+                    if (m_Context.messageCallback)
+                        m_Context.messageCallback->message(MessageSeverity::Fatal,
+                            (std::string("[nvrhi] Metal GPU submission failed: ") + (message ? message : "unknown error")).c_str());
+                    m_Context.info("[metal3] failed submission=" + std::to_string(submitted.instance) +
+                        " allocated_bytes=" + std::to_string(m_Context.device.currentAllocatedSize) +
+                        " recommended_working_set_bytes=" + std::to_string(m_Context.device.recommendedMaxWorkingSetSize));
+                    NSArray<id<MTLCommandBufferEncoderInfo>>* encoders =
+                        submitted.commandBuffer.error.userInfo[MTLCommandBufferEncoderInfoErrorKey];
+                    NSUInteger encoderIndex = 0;
+                    for (id<MTLCommandBufferEncoderInfo> encoder in encoders)
+                    {
+                        const char* state = "unknown";
+                        switch (encoder.errorState)
+                        {
+                        case MTLCommandEncoderErrorStateCompleted: state = "completed"; break;
+                        case MTLCommandEncoderErrorStateAffected: state = "affected"; break;
+                        case MTLCommandEncoderErrorStatePending: state = "pending"; break;
+                        case MTLCommandEncoderErrorStateFaulted: state = "faulted"; break;
+                        default: break;
+                        }
+                        const char* label = encoder.label.UTF8String;
+                        m_Context.info("[metal3] encoder=" + std::to_string(encoderIndex++) +
+                            " state=" + state + " label=" + (label ? label : "<unlabelled>"));
+                        for (NSString* signpost in encoder.debugSignposts)
+                            m_Context.info(std::string("[metal3] signpost=") + signpost.UTF8String);
+                    }
+                    if (!encoders.count)
+                        m_Context.info("[metal3] No encoder execution details; enable LDV_METAL3_ENCODER_STATUS=1 before launch.");
                 }
                 if (submitted.lastInBatch)
                     queue.completed = submitted.instance;
