@@ -769,6 +769,8 @@ namespace nvrhi::metal3
         id<MTLCommandBuffer> trackedCmdBuffer = nil;
         id<MTLRenderCommandEncoder> m_RenderEncoder = nil;
         id<MTLComputeCommandEncoder> m_ComputeEncoder = nil;
+        id<MTLFence> m_WorkloadCompletionFence = nil;
+        id<MTLFence> m_TimerBoundaryFence = nil;
 
         std::vector<BindingSetHandle> m_ReferencedBindingSets;
         std::vector<id<MTLBuffer>> m_ReferencedNativeBuffers;
@@ -792,6 +794,14 @@ namespace nvrhi::metal3
 #endif
 
         void endEncoding();
+        void beginEncoding(id<MTLRenderCommandEncoder> encoder, const char* operation);
+        void beginEncoding(id<MTLComputeCommandEncoder> encoder, const char* operation);
+        void beginEncoding(id<MTLBlitCommandEncoder> encoder, const char* operation);
+        void endEncoding(id<MTLRenderCommandEncoder> encoder);
+        void endEncoding(id<MTLComputeCommandEncoder> encoder);
+        void endEncoding(id<MTLBlitCommandEncoder> encoder);
+        id<MTLFence> createTimerFence();
+        id<MTLFence> getWorkloadCompletionFence();
         void annotateEncoder(id<MTLCommandEncoder> encoder, const char* operation);
         bool encodeTimerBoundary(TimerQuery* query, bool ending);
         void bindGraphicsBuffer(id<MTLRenderCommandEncoder> encoder, id<MTLBuffer> buffer,

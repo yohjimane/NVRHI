@@ -4,12 +4,15 @@ namespace nvrhi::metal3
 {
     static MTLTextureUsage textureUsageFromDesc(const TextureDesc& desc)
     {
-        MTLTextureUsage usage = MTLTextureUsagePixelFormatView;
+        const auto& formatInfo = getFormatInfo(desc.format);
+        MTLTextureUsage usage = (desc.isTypeless && !formatInfo.hasDepth && !formatInfo.hasStencil)
+            || (formatInfo.hasDepth && formatInfo.hasStencil)
+            ? MTLTextureUsagePixelFormatView : MTLTextureUsageUnknown;
         if (desc.isShaderResource)
             usage |= MTLTextureUsageShaderRead;
         if (desc.isUAV)
             usage |= MTLTextureUsageShaderWrite | MTLTextureUsageShaderRead;
-        if (desc.isRenderTarget)
+        if (desc.isRenderTarget || desc.isUAV)
             usage |= MTLTextureUsageRenderTarget;
         return usage == MTLTextureUsageUnknown ? MTLTextureUsageShaderRead : usage;
     }

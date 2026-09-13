@@ -472,6 +472,264 @@ namespace
         return shader;
     }
 
+    void uavTextureClears()
+    {
+        Fixture f;
+        nvrhi::TextureDesc desc;
+        desc.width = desc.height = 8;
+        desc.arraySize = desc.mipLevels = 2;
+        desc.dimension = nvrhi::TextureDimension::Texture2DArray;
+        desc.format = nvrhi::Format::RGBA32_FLOAT;
+        desc.isUAV = true;
+        auto texture = f.device->createTexture(desc);
+        require(texture != nullptr, "UAV texture allocation failed");
+        nvrhi::TextureSubresourceSet selected;
+        selected.baseMipLevel = selected.baseArraySlice = 1;
+        selected.numMipLevels = selected.numArraySlices = 1;
+        auto commands = f.list();
+        commands->open();
+        commands->clearTextureFloat(texture, nvrhi::AllSubresources, nvrhi::Color(0.25f));
+        commands->clearTextureFloat(texture, selected, nvrhi::Color(1.f, 2.f, 3.f, 4.f));
+        commands->close();
+        f.execute(commands);
+        f.device->waitForIdle();
+        id<MTLTexture> nativeTexture = (__bridge id<MTLTexture>)texture->getNativeObject(nvrhi::ObjectTypes::MTL3_Texture).pointer;
+        id<MTLBuffer> readback = [f.desc.pDevice newBufferWithLength:2048 options:MTLResourceStorageModeShared];
+        id<MTLCommandBuffer> transfer = [f.desc.commonQueue commandBuffer];
+        id<MTLBlitCommandEncoder> blit = [transfer blitCommandEncoder];
+        for (NSUInteger slice = 0; slice < 2; ++slice)
+            [blit copyFromTexture:nativeTexture sourceSlice:slice sourceLevel:1 sourceOrigin:MTLOriginMake(0, 0, 0)
+                sourceSize:MTLSizeMake(4, 4, 1) toBuffer:readback destinationOffset:slice * 1024
+                destinationBytesPerRow:256 destinationBytesPerImage:1024];
+        [blit endEncoding];
+        [transfer commit];
+        [transfer waitUntilCompleted];
+        require(transfer.status == MTLCommandBufferStatusCompleted, "UAV clear readback failed");
+        for (unsigned slice = 0; slice < 2; ++slice)
+            for (unsigned y = 0; y < 4; ++y)
+                for (unsigned x = 0; x < 4; ++x)
+                    for (unsigned channel = 0; channel < 4; ++channel)
+                    {
+                        const auto* row = reinterpret_cast<const float*>(
+                            static_cast<const uint8_t*>(readback.contents) + slice * 1024 + y * 256);
+                        require(row[x * 4 + channel] == (slice ? float(channel + 1) : 0.25f),
+                            "UAV clear lost a channel or modified an unselected array slice");
+                    }
+        f.checkErrors();
+    }
+
+    void textureViewResults()
+    {
+        Fixture f;
+        nvrhi::TextureDesc desc;
+        desc.width = desc.height = 2;
+        desc.arraySize = desc.mipLevels = 2;
+        desc.dimension = nvrhi::TextureDimension::Texture2DArray;
+        desc.format = nvrhi::Format::RGBA8_UNORM;
+        desc.initialState = nvrhi::ResourceStates::ShaderResource;
+        desc.keepInitialState = true;
+        auto typed = f.device->createTexture(desc);
+        desc.width = desc.height = desc.arraySize = desc.mipLevels = 1;
+        desc.dimension = nvrhi::TextureDimension::Texture2D;
+        desc.isTypeless = true;
+        auto typeless = f.device->createTexture(desc);
+        desc.format = nvrhi::Format::D32S8;
+        desc.isTypeless = false;
+        desc.isRenderTarget = true;
+        auto depthStencil = f.device->createTexture(desc);
+        desc.format = nvrhi::Format::D32;
+        desc.isTypeless = true;
+        auto depthOnly = f.device->createTexture(desc);
+        require(typed != nullptr && typeless != nullptr && depthStencil != nullptr && depthOnly != nullptr,
+            "View texture creation failed");
+        auto uploads = f.list();
+        uploads->open();
+        const uint32_t background[] = {0x11223344u, 0x11223344u, 0x11223344u, 0x11223344u};
+        const uint32_t selected = 0x80402080u;
+        const uint32_t reinterpreted = 0x12345678u;
+        for (unsigned slice = 0; slice < 2; ++slice)
+        {
+            uploads->writeTexture(typed, slice, 0, background, 2 * sizeof(uint32_t));
+            uploads->writeTexture(typed, slice, 1, slice == 1 ? &selected : background, sizeof(uint32_t));
+        }
+        uploads->writeTexture(typeless, 0, 0, &reinterpreted, sizeof(uint32_t));
+        uploads->clearDepthStencilTexture(depthStencil, nvrhi::AllSubresources, true, 0.375f, true, 0x6d);
+        uploads->clearDepthStencilTexture(depthOnly, nvrhi::AllSubresources, true, 0.625f, false, 0);
+        uploads->close();
+        f.execute(uploads);
+        f.device->waitForIdle();
+        const nvrhi::TextureSubresourceSet selectedSubresource(1, 1, 1, 1);
+        const auto swizzle = nvrhi::ComponentMapping()
+            .setR(nvrhi::ComponentSwizzle::B).setG(nvrhi::ComponentSwizzle::R)
+            .setB(nvrhi::ComponentSwizzle::One).setA(nvrhi::ComponentSwizzle::Zero);
+        std::array<id<MTLTexture>, 7> views = {
+            (__bridge id<MTLTexture>)typed->getNativeView(nvrhi::ObjectTypes::MTL3_Texture,
+                nvrhi::Format::RGBA8_UNORM, selectedSubresource, nvrhi::TextureDimension::Texture2D).pointer,
+            (__bridge id<MTLTexture>)typed->getNativeView(nvrhi::ObjectTypes::MTL3_Texture,
+                nvrhi::Format::SRGBA8_UNORM, selectedSubresource, nvrhi::TextureDimension::Texture2D).pointer,
+            (__bridge id<MTLTexture>)typed->getNativeView(nvrhi::ObjectTypes::MTL3_Texture,
+                nvrhi::Format::RGBA8_UNORM, selectedSubresource, nvrhi::TextureDimension::Texture2D, false, swizzle).pointer,
+            (__bridge id<MTLTexture>)typeless->getNativeView(nvrhi::ObjectTypes::MTL3_Texture,
+                nvrhi::Format::R32_UINT).pointer,
+            (__bridge id<MTLTexture>)depthStencil->getNativeView(nvrhi::ObjectTypes::MTL3_Texture).pointer,
+            nil,
+            (__bridge id<MTLTexture>)depthOnly->getNativeView(nvrhi::ObjectTypes::MTL3_Texture).pointer
+        };
+        views[5] = [views[4] newTextureViewWithPixelFormat:MTLPixelFormatX32_Stencil8];
+        for (auto view : views)
+            require(view != nil, "Required texture view creation failed");
+        NSError* error = nil;
+        NSString* source = @"#include <metal_stdlib>\n"
+            "using namespace metal;\n"
+            "kernel void readViews(texture2d<float, access::read> linear [[texture(0)]],"
+            "texture2d<float, access::read> srgb [[texture(1)]],"
+            "texture2d<float, access::read> swizzled [[texture(2)]],"
+            "texture2d<uint, access::read> integer [[texture(3)]],"
+            "depth2d<float, access::read> depth [[texture(4)]],"
+            "texture2d<uint, access::read> stencil [[texture(5)]],"
+            "depth2d<float, access::read> depthOnly [[texture(6)]], device uint4* output [[buffer(0)]]) {"
+            "output[0] = as_type<uint4>(linear.read(uint2(0)));"
+            "output[1] = as_type<uint4>(srgb.read(uint2(0)));"
+            "output[2] = as_type<uint4>(swizzled.read(uint2(0)));"
+            "output[3] = uint4(integer.read(uint2(0)).r, stencil.read(uint2(0)).r, 0, 0);"
+            "output[4] = as_type<uint4>(float4(depth.read(uint2(0)), depthOnly.read(uint2(0)), 0, 0)); }";
+        id<MTLLibrary> library = [f.desc.pDevice newLibraryWithSource:source options:nil error:&error];
+        require(library != nil, "View shader compilation failed");
+        id<MTLComputePipelineState> pipeline = [f.desc.pDevice
+            newComputePipelineStateWithFunction:[library newFunctionWithName:@"readViews"] error:&error];
+        require(pipeline != nil, "View pipeline creation failed");
+        id<MTLCommandBuffer> commands = [f.desc.commonQueue commandBuffer];
+        id<MTLComputeCommandEncoder> encoder = [commands computeCommandEncoder];
+        [encoder setComputePipelineState:pipeline];
+        for (unsigned index = 0; index < views.size(); ++index)
+            [encoder setTexture:views[index] atIndex:index];
+        [encoder setBuffer:(__bridge id<MTLBuffer>)
+            f.buffer->getNativeObject(nvrhi::ObjectTypes::MTL3_Buffer).pointer offset:0 atIndex:0];
+        [encoder dispatchThreads:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+        [encoder endEncoding];
+        [commands commit];
+        [commands waitUntilCompleted];
+        require(commands.status == MTLCommandBufferStatusCompleted, "Texture view GPU reads failed");
+        const float linear[] = {128.f / 255.f, 32.f / 255.f, 64.f / 255.f, 128.f / 255.f};
+        const float swizzled[] = {linear[2], linear[0], 1.f, 0.f};
+        for (unsigned view = 0; view < 3; ++view)
+        {
+            float actual[4];
+            std::memcpy(actual, f.words + view * 4, sizeof(actual));
+            for (unsigned channel = 0; channel < 4; ++channel)
+            {
+                const float expected = view == 2 ? swizzled[channel]
+                    : view == 1 && channel < 3 ? std::pow((linear[channel] + 0.055f) / 1.055f, 2.4f)
+                    : linear[channel];
+                require(std::abs(actual[channel] - expected) < 0.002f,
+                    "Typed subresource, sRGB, or swizzled view returned incorrect components");
+            }
+        }
+        require(f.words[12] == reinterpreted && f.words[13] == 0x6d,
+            "Typeless reinterpretation or stencil aspect returned incorrect data");
+        float depth;
+        std::memcpy(&depth, f.words + 16, sizeof(depth));
+        require(depth == 0.375f, "Combined depth/stencil texture lost its depth aspect");
+        std::memcpy(&depth, f.words + 17, sizeof(depth));
+        require(depth == 0.625f, "Typeless single-aspect depth texture returned incorrect depth");
+        f.checkErrors();
+    }
+
+    void fragmentTimerOrdering()
+    {
+        Fixture f;
+        nvrhi::RefCountPtr<IDxcCompiler3> compiler;
+        require(SUCCEEDED(DxcCreateInstance(CLSID_DxcCompiler, IID_PPV_ARGS(compiler.GetAddressOf()))),
+            "DXC compiler creation failed");
+        const char* source =
+            "float4 vsMain(uint id : SV_VertexID) : SV_Position {"
+            "float2 p = float2((id << 1) & 2, id & 2); return float4(p * 2 - 1, 0, 1); }"
+            "float4 psMain() : SV_Target { return float4(1, 2, 3, 1) / 64; }";
+        constexpr unsigned width = 2252;
+        constexpr unsigned height = 1672;
+        nvrhi::TextureDesc desc;
+        desc.width = width;
+        desc.height = height;
+        desc.format = nvrhi::Format::RGBA16_FLOAT;
+        desc.isRenderTarget = true;
+        desc.initialState = nvrhi::ResourceStates::RenderTarget;
+        desc.keepInitialState = true;
+        auto texture = f.device->createTexture(desc);
+        require(texture != nullptr, "Fragment timer texture creation failed");
+        auto framebuffer = f.device->createFramebuffer(nvrhi::FramebufferDesc().addColorAttachment(texture));
+        require(framebuffer != nullptr, "Fragment timer framebuffer creation failed");
+        nvrhi::GraphicsPipelineDesc pipelineDesc;
+        pipelineDesc.VS = compileRegressionShader(f.device, compiler, source, nvrhi::ShaderType::Vertex);
+        pipelineDesc.PS = compileRegressionShader(f.device, compiler, source, nvrhi::ShaderType::Pixel);
+        pipelineDesc.renderState.depthStencilState.depthTestEnable = false;
+        pipelineDesc.renderState.depthStencilState.depthWriteEnable = false;
+        pipelineDesc.renderState.rasterState.cullMode = nvrhi::RasterCullMode::None;
+        auto& blend = pipelineDesc.renderState.blendState.targets[0];
+        blend.blendEnable = true;
+        blend.srcBlend = blend.destBlend = nvrhi::BlendFactor::One;
+        blend.srcBlendAlpha = blend.destBlendAlpha = nvrhi::BlendFactor::One;
+        auto pipeline = f.device->createGraphicsPipeline(pipelineDesc, framebuffer->getFramebufferInfo());
+        require(pipeline != nullptr, "Fragment timer pipeline creation failed");
+        auto initialize = f.list();
+        initialize->open();
+        initialize->clearTextureFloat(texture, nvrhi::AllSubresources, nvrhi::Color(0.f));
+        initialize->close();
+        f.execute(initialize);
+        f.device->waitForIdle();
+        auto query = f.device->createTimerQuery();
+        auto trailingQuery = f.device->createTimerQuery();
+        require(query != nullptr && trailingQuery != nullptr, "Fragment timer allocation failed");
+        auto commands = f.list();
+        commands->open();
+        auto native = static_cast<nvrhi::metal3::ICommandList*>(commands.Get())->getNativeCommandBuffer();
+        commands->beginTimerQuery(query);
+        nvrhi::GraphicsState state;
+        state.pipeline = pipeline;
+        state.framebuffer = framebuffer;
+        state.viewport.addViewport(nvrhi::Viewport(float(width), float(height)));
+        state.viewport.addScissorRect(nvrhi::Rect(0, width, 0, height));
+        commands->setGraphicsState(state);
+        for (unsigned draw = 0; draw < 64; ++draw)
+            commands->draw(nvrhi::DrawArguments().setVertexCount(3));
+        commands->beginTimerQuery(trailingQuery);
+        commands->endTimerQuery(trailingQuery);
+        commands->endTimerQuery(query);
+        commands->close();
+        f.execute(commands);
+        [native waitUntilCompleted];
+        require(native.status == MTLCommandBufferStatusCompleted, "Fragment timer GPU work failed");
+        const double enclosing = native.GPUEndTime - native.GPUStartTime;
+        const double measured = f.device->getTimerQueryTime(query);
+        require(std::isfinite(enclosing) && enclosing > 0.0 && std::isfinite(measured),
+            "Fragment timer GPU durations are unavailable");
+        require(measured >= enclosing * 0.5 && measured <= enclosing * 1.1,
+            "GPU timer did not enclose its command buffer's fragment workload");
+        const double trailing = f.device->getTimerQueryTime(trailingQuery);
+        require(std::isfinite(trailing) && trailing > 0.0 && trailing < measured * 0.5,
+            "Empty trailing timer included fragment work recorded before its begin");
+        id<MTLCommandBuffer> readback = [f.desc.commonQueue commandBuffer];
+        id<MTLBlitCommandEncoder> blit = [readback blitCommandEncoder];
+        const MTLOrigin origins[] = {
+            MTLOriginMake(0, 0, 0), MTLOriginMake(width / 2, height / 2, 0),
+            MTLOriginMake(width - 1, height - 1, 0)
+        };
+        for (unsigned index = 0; index < 3; ++index)
+            [blit copyFromTexture:(__bridge id<MTLTexture>)
+                texture->getNativeObject(nvrhi::ObjectTypes::MTL3_Texture).pointer
+                sourceSlice:0 sourceLevel:0 sourceOrigin:origins[index] sourceSize:MTLSizeMake(1, 1, 1)
+                toBuffer:(__bridge id<MTLBuffer>)f.buffer->getNativeObject(nvrhi::ObjectTypes::MTL3_Buffer).pointer
+                destinationOffset:index * 256 destinationBytesPerRow:256 destinationBytesPerImage:256];
+        [blit endEncoding];
+        [readback commit];
+        [readback waitUntilCompleted];
+        require(readback.status == MTLCommandBufferStatusCompleted, "Fragment timer readback failed");
+        const uint16_t expected[] = {0x3c00, 0x4000, 0x4200, 0x3c00};
+        for (unsigned index = 0; index < 3; ++index)
+            require(std::memcmp(f.words + index * 64, expected, sizeof(expected)) == 0,
+                "Fragment timer instrumentation lost blended fullscreen draws");
+        f.checkErrors();
+    }
+
     void sparseDescriptorSnapshots()
     {
         Fixture f;
@@ -1141,6 +1399,9 @@ int main()
             timerQueries();
             reusedTimerQueriesAcrossGpuWaits();
             mixedTimerQueries();
+            fragmentTimerOrdering();
+            textureViewResults();
+            uavTextureClears();
             sparseDescriptorSnapshots();
             interruptedIndirectDraws();
             countedIndirectBindings();

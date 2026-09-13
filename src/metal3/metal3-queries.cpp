@@ -151,7 +151,7 @@ namespace nvrhi::metal3
                     return std::numeric_limits<float>::quiet_NaN();
                 }
             }
-            double elapsed = double(values[TimerQueryPool::SamplesPerQuery - 1].timestamp - values[0].timestamp);
+            double elapsed = double(values[TimerQueryPool::SamplesPerQuery - 1].timestamp - values[1].timestamp);
             if (!query->pool->timestampsInNanoseconds)
             {
                 MTLTimestamp cpuTimestamp = 0;
@@ -189,6 +189,13 @@ namespace nvrhi::metal3
     bool CommandList::encodeTimerBoundary(TimerQuery* query, bool ending)
     {
         endEncoding();
+        if (m_RecordingFailed)
+            return false;
+        id<MTLFence> boundaryFence = m_TimerBoundaryFence;
+        if (!boundaryFence)
+            boundaryFence = createTimerFence();
+        if (!boundaryFence)
+            return false;
         const NSUInteger firstSample = query->sampleIndex + (ending ? 2 : 0);
         MTLComputePassDescriptor* pass = [MTLComputePassDescriptor computePassDescriptor];
         pass.sampleBufferAttachments[0].sampleBuffer = query->samples;
@@ -202,11 +209,17 @@ namespace nvrhi::metal3
             return false;
         }
         annotateEncoder(encoder, ending ? "endTimerQuery" : "beginTimerQuery");
+        if (m_WorkloadCompletionFence)
+            [encoder waitForFence:m_WorkloadCompletionFence];
+        if (m_TimerBoundaryFence)
+            [encoder waitForFence:m_TimerBoundaryFence];
         [encoder setComputePipelineState:query->pool->markerPipeline];
         [encoder setBuffer:query->markers
             offset:(query->sampleIndex / TimerQueryPool::SamplesPerQuery) * sizeof(uint32_t) atIndex:0];
         [encoder dispatchThreads:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+        [encoder updateFence:boundaryFence];
         [encoder endEncoding];
+        m_TimerBoundaryFence = boundaryFence;
         return true;
     }
 

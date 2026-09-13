@@ -1679,16 +1679,88 @@ namespace nvrhi::metal3
     }
 #endif
 
+    id<MTLFence> CommandList::createTimerFence()
+    {
+        id<MTLFence> fence = [m_Context.device newFence];
+        if (!fence)
+        {
+            m_RecordingFailed = true;
+            m_Context.error("[nvrhi] Cannot allocate GPU timestamp ordering fence.");
+            return nil;
+        }
+        [trackedCmdBuffer addCompletedHandler:^(id<MTLCommandBuffer>) {
+            (void)fence;
+        }];
+        return fence;
+    }
+
+    id<MTLFence> CommandList::getWorkloadCompletionFence()
+    {
+        if (!m_WorkloadCompletionFence)
+            m_WorkloadCompletionFence = createTimerFence();
+        return m_WorkloadCompletionFence;
+    }
+
+    void CommandList::beginEncoding(id<MTLRenderCommandEncoder> encoder, const char* operation)
+    {
+        annotateEncoder(encoder, operation);
+        if (m_TimerBoundaryFence)
+            [encoder waitForFence:m_TimerBoundaryFence beforeStages:
+                MTLRenderStageVertex | MTLRenderStageFragment | MTLRenderStageObject | MTLRenderStageMesh];
+    }
+
+    void CommandList::beginEncoding(id<MTLComputeCommandEncoder> encoder, const char* operation)
+    {
+        annotateEncoder(encoder, operation);
+        if (m_TimerBoundaryFence)
+            [encoder waitForFence:m_TimerBoundaryFence];
+    }
+
+    void CommandList::beginEncoding(id<MTLBlitCommandEncoder> encoder, const char* operation)
+    {
+        annotateEncoder(encoder, operation);
+        if (m_TimerBoundaryFence)
+            [encoder waitForFence:m_TimerBoundaryFence];
+    }
+
+    void CommandList::endEncoding(id<MTLRenderCommandEncoder> encoder)
+    {
+        if (!encoder)
+            return;
+        if (id<MTLFence> fence = getWorkloadCompletionFence())
+            [encoder updateFence:fence afterStages:
+                MTLRenderStageVertex | MTLRenderStageFragment | MTLRenderStageObject | MTLRenderStageMesh];
+        [encoder endEncoding];
+    }
+
+    void CommandList::endEncoding(id<MTLComputeCommandEncoder> encoder)
+    {
+        if (!encoder)
+            return;
+        if (id<MTLFence> fence = getWorkloadCompletionFence())
+            [encoder updateFence:fence];
+        [encoder endEncoding];
+    }
+
+    void CommandList::endEncoding(id<MTLBlitCommandEncoder> encoder)
+    {
+        if (!encoder)
+            return;
+        if (id<MTLFence> fence = getWorkloadCompletionFence())
+            [encoder updateFence:fence];
+        [encoder endEncoding];
+    }
+
     void CommandList::endEncoding()
     {
         if (m_RenderEncoder)
         {
-            [m_RenderEncoder endEncoding];
+            endEncoding(m_RenderEncoder);
             m_RenderEncoder = nil;
         }
         if (m_ComputeEncoder)
         {
-            [m_ComputeEncoder endEncoding];
+            endEncoding(m_ComputeEncoder);
             m_ComputeEncoder = nil;
         }
         m_BindingStatesDirty = true;
@@ -1719,6 +1791,8 @@ namespace nvrhi::metal3
         }
 
         trackedCmdBuffer = nil;
+        m_WorkloadCompletionFence = nil;
+        m_TimerBoundaryFence = nil;
         m_UploadManager.discardCommandBuffer();
         m_ArgumentTableManager.discardCommandBuffer();
         m_TransientIndirectResources.discardCommandBuffer();
@@ -1863,8 +1937,8 @@ namespace nvrhi::metal3
                 rp.colorAttachments[0].storeAction = MTLStoreActionStore;
                 rp.colorAttachments[0].clearColor = MTLClearColorMake(clearColor.r, clearColor.g, clearColor.b, clearColor.a);
                 id<MTLRenderCommandEncoder> encoder = [trackedCmdBuffer renderCommandEncoderWithDescriptor:rp];
-                annotateEncoder(encoder, __func__);
-                [encoder endEncoding];
+                beginEncoding(encoder, __func__);
+                endEncoding(encoder);
             }
         }
     }
@@ -1901,8 +1975,8 @@ namespace nvrhi::metal3
                     rp.stencilAttachment.clearStencil = stencil;
                 }
                 id<MTLRenderCommandEncoder> encoder = [trackedCmdBuffer renderCommandEncoderWithDescriptor:rp];
-                annotateEncoder(encoder, __func__);
-                [encoder endEncoding];
+                beginEncoding(encoder, __func__);
+                endEncoding(encoder);
             }
         }
     }
@@ -1947,7 +2021,7 @@ namespace nvrhi::metal3
 
         endEncoding();
         id<MTLBlitCommandEncoder> blit = [trackedCmdBuffer blitCommandEncoder];
-        annotateEncoder(blit, __func__);
+        beginEncoding(blit, __func__);
         [blit copyFromTexture:s->texture
                   sourceSlice:ss.arraySlice
                   sourceLevel:ss.mipLevel
@@ -1957,7 +2031,7 @@ namespace nvrhi::metal3
              destinationSlice:ds.arraySlice
              destinationLevel:ds.mipLevel
             destinationOrigin:MTLOriginMake(ds.x, ds.y, ds.z)];
-        [blit endEncoding];
+        endEncoding(blit);
     }
 
     /*
@@ -2027,7 +2101,7 @@ namespace nvrhi::metal3
 
         endEncoding();
         id<MTLBlitCommandEncoder> blit = [trackedCmdBuffer blitCommandEncoder];
-        annotateEncoder(blit, __func__);
+        beginEncoding(blit, __func__);
         [blit copyFromBuffer:upload.buffer
                  sourceOffset:upload.offset
             sourceBytesPerRow:naturalRowPitch
@@ -2037,7 +2111,7 @@ namespace nvrhi::metal3
              destinationSlice:arraySlice
              destinationLevel:mipLevel
             destinationOrigin:MTLOriginMake(0, 0, 0)];
-        [blit endEncoding];
+        endEncoding(blit);
     }
 
     void CommandList::resolveTexture(ITexture* dest, const TextureSubresourceSet& dstSubresources, ITexture* src, const TextureSubresourceSet& srcSubresources)
@@ -2083,8 +2157,8 @@ namespace nvrhi::metal3
                 colorAttachment.resolveSlice = arrayIndex + dstSR.baseArraySlice;
 
                 id<MTLRenderCommandEncoder> encoder = [trackedCmdBuffer renderCommandEncoderWithDescriptor:rp];
-                annotateEncoder(encoder, __func__);
-                [encoder endEncoding];
+                beginEncoding(encoder, __func__);
+                endEncoding(encoder);
             }
         }
     }
@@ -2133,13 +2207,13 @@ namespace nvrhi::metal3
 
         endEncoding();
         id<MTLBlitCommandEncoder> blit = [trackedCmdBuffer blitCommandEncoder];
-        annotateEncoder(blit, __func__);
+        beginEncoding(blit, __func__);
         [blit copyFromBuffer:upload.buffer
                 sourceOffset:upload.offset
                     toBuffer:buffer->buffer
            destinationOffset:NSUInteger(destOffsetBytes)
                         size:NSUInteger(dataSize)];
-        [blit endEncoding];
+        endEncoding(blit);
     }
 
     void CommandList::clearBufferUInt(IBuffer* b, uint32_t clearValue)
@@ -2161,11 +2235,11 @@ namespace nvrhi::metal3
             // following compute encoder.
             endEncoding();
             id<MTLBlitCommandEncoder> blit = [trackedCmdBuffer blitCommandEncoder];
-            annotateEncoder(blit, __func__);
+            beginEncoding(blit, __func__);
             [blit fillBuffer:buffer->buffer
                        range:NSMakeRange(0, NSUInteger(buffer->desc.byteSize))
                        value:0];
-            [blit endEncoding];
+            endEncoding(blit);
             return;
         }
         // repeatable pattern does the same style blit
@@ -2175,11 +2249,11 @@ namespace nvrhi::metal3
         {
             endEncoding();
             id<MTLBlitCommandEncoder> blit = [trackedCmdBuffer blitCommandEncoder];
-            annotateEncoder(blit, __func__);
+            beginEncoding(blit, __func__);
             [blit fillBuffer:buffer->buffer
                        range:NSMakeRange(0, NSUInteger(clearSize))
                        value:bytePattern];
-            [blit endEncoding];
+            endEncoding(blit);
             return;
         }
 
@@ -2199,13 +2273,13 @@ namespace nvrhi::metal3
 
         endEncoding();
         id<MTLBlitCommandEncoder> blit = [trackedCmdBuffer blitCommandEncoder];
-        annotateEncoder(blit, __func__);
+        beginEncoding(blit, __func__);
         [blit copyFromBuffer:upload.buffer
                 sourceOffset:upload.offset
                     toBuffer:buffer->buffer
            destinationOffset:0
                         size:NSUInteger(uploadSize)];
-        [blit endEncoding];
+        endEncoding(blit);
     }
 
     void CommandList::copyBuffer(IBuffer* dest, uint64_t destOffsetBytes, IBuffer* src, uint64_t srcOffsetBytes, uint64_t dataSizeBytes)
@@ -2226,13 +2300,13 @@ namespace nvrhi::metal3
 
         endEncoding();
         id<MTLBlitCommandEncoder> blit = [trackedCmdBuffer blitCommandEncoder];
-        annotateEncoder(blit, __func__);
+        beginEncoding(blit, __func__);
         [blit copyFromBuffer:s->buffer
                 sourceOffset:NSUInteger(srcOffsetBytes)
                     toBuffer:d->buffer
            destinationOffset:NSUInteger(destOffsetBytes)
                         size:NSUInteger(dataSizeBytes)];
-        [blit endEncoding];
+        endEncoding(blit);
     }
 
     void CommandList::setGraphicsState(const GraphicsState& state)
@@ -2322,7 +2396,7 @@ namespace nvrhi::metal3
 #endif
 
         m_RenderEncoder = [trackedCmdBuffer renderCommandEncoderWithDescriptor:rp];
-        annotateEncoder(m_RenderEncoder, "render");
+        beginEncoding(m_RenderEncoder, "render");
         if (!m_RenderEncoder)
             m_Context.error("[metal3-trace] failed to create render command encoder");
         return m_RenderEncoder;
@@ -2337,7 +2411,7 @@ namespace nvrhi::metal3
         beginTracyComputeEncoderZone(cp);
 #endif
         m_ComputeEncoder = [trackedCmdBuffer computeCommandEncoderWithDescriptor:cp];
-        annotateEncoder(m_ComputeEncoder, "compute");
+        beginEncoding(m_ComputeEncoder, "compute");
         if (!m_ComputeEncoder)
             m_Context.error("[metal3-trace] failed to create compute command encoder");
         return m_ComputeEncoder;
@@ -2570,7 +2644,7 @@ namespace nvrhi::metal3
             // geometry-emulation graphics state before issuing mesh indirect draws.
             endEncoding();
             id<MTLComputeCommandEncoder> compute = [trackedCmdBuffer computeCommandEncoder];
-            annotateEncoder(compute, __func__);
+            beginEncoding(compute, __func__);
             [compute setComputePipelineState:fillState.pipeline];
             [compute setBuffer:indirectParams->buffer offset:0 atIndex:0];
             [compute setBuffer:drawInfoAllocation.buffer offset:drawInfoAllocation.offset atIndex:1];
@@ -2586,7 +2660,7 @@ namespace nvrhi::metal3
             const NSUInteger groups = (NSUInteger(drawCount) + threads - 1) / threads;
             [compute dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
                     threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
-            [compute endEncoding];
+            endEncoding(compute);
 
             id<MTLRenderCommandEncoder> renderEncoder = getOrCreateRenderEncoder();
             if (!renderEncoder)
@@ -2806,7 +2880,7 @@ namespace nvrhi::metal3
             // GPU, because the original indexed indirect args are GPU-owned.
             endEncoding();
             id<MTLComputeCommandEncoder> compute = [trackedCmdBuffer computeCommandEncoder];
-            annotateEncoder(compute, __func__);
+            beginEncoding(compute, __func__);
             [compute setComputePipelineState:fillState.pipeline];
             [compute setBuffer:indirectParams->buffer offset:0 atIndex:0];
             [compute setBuffer:drawInfoAllocation.buffer offset:drawInfoAllocation.offset atIndex:1];
@@ -2822,7 +2896,7 @@ namespace nvrhi::metal3
             const NSUInteger groups = (NSUInteger(drawCount) + threads - 1) / threads;
             [compute dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
                     threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
-            [compute endEncoding];
+            endEncoding(compute);
 
             id<MTLRenderCommandEncoder> renderEncoder = getOrCreateRenderEncoder();
             if (!renderEncoder)
@@ -3031,15 +3105,15 @@ namespace nvrhi::metal3
         // ICB memory is reused by Metal internally; reset the command range before
         // the compute pass selectively fills commands 0..min(gpuCount,maxDrawCount).
         id<MTLBlitCommandEncoder> blit = [trackedCmdBuffer blitCommandEncoder];
-        annotateEncoder(blit, "reset indexed ICB");
+        beginEncoding(blit, "reset indexed ICB");
         [blit resetCommandsInBuffer:icb withRange:NSMakeRange(0, icbCapacity)];
-        [blit endEncoding];
+        endEncoding(blit);
 
         // Fill the ICB on the GPU. Thread 0 writes the execution range from the
         // GPU count buffer, and each thread below that count writes one indexed
         // draw command from indirectParams[tid].
         id<MTLComputeCommandEncoder> compute = [trackedCmdBuffer computeCommandEncoder];
-        annotateEncoder(compute, "fill indexed ICB");
+        beginEncoding(compute, "fill indexed ICB");
         [compute setComputePipelineState:fillState.pipeline];
         [compute setBuffer:indirectParams->buffer offset:0 atIndex:0];
         [compute setBuffer:indirectCount->buffer offset:0 atIndex:1];
@@ -3062,7 +3136,7 @@ namespace nvrhi::metal3
         const NSUInteger threads = std::max<NSUInteger>(1, fillState.pipeline.threadExecutionWidth);
         const NSUInteger groups = (NSUInteger(maxDrawCount) + threads - 1) / threads;
         [compute dispatchThreadgroups:MTLSizeMake(groups, 1, 1) threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
-        [compute endEncoding];
+        endEncoding(compute);
 
         renderEncoder = getOrCreateRenderEncoder();
         if (!renderEncoder)
@@ -3262,15 +3336,15 @@ namespace nvrhi::metal3
             // commands below min(gpuCount, maxDrawCount), and executeCommands uses
             // the GPU-written range to skip the rest.
             id<MTLBlitCommandEncoder> blit = [trackedCmdBuffer blitCommandEncoder];
-            annotateEncoder(blit, "reset geometry ICB");
+            beginEncoding(blit, "reset geometry ICB");
             [blit resetCommandsInBuffer:icb withRange:NSMakeRange(0, icbCapacity)];
-            [blit endEncoding];
+            endEncoding(blit);
 
             // Fill the per-draw IRRuntime records and ICB commands on GPU. This is
             // the counted part of the path: the shader reads indirectCount and no
             // CPU-side loop or readback is needed.
             id<MTLComputeCommandEncoder> compute = [trackedCmdBuffer computeCommandEncoder];
-            annotateEncoder(compute, "fill geometry ICB");
+            beginEncoding(compute, "fill geometry ICB");
             if (!compute)
             {
                 m_Context.error("[metal3] failed to create compute encoder for geometry counted indexed indirect ICB fill");
@@ -3311,7 +3385,7 @@ namespace nvrhi::metal3
             const NSUInteger groups = (NSUInteger(maxDrawCount) + threads - 1) / threads;
             [compute dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
                     threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
-            [compute endEncoding];
+            endEncoding(compute);
 
             id<MTLRenderCommandEncoder> renderEncoder = getOrCreateRenderEncoder();
             if (!renderEncoder)
@@ -3377,7 +3451,6 @@ namespace nvrhi::metal3
         m_CurrentComputeStateValid = true;
         if (state.pipeline)
             m_ReferencedStateResources.emplace_back(state.pipeline);
-        endEncoding();
         if (m_EnableAutomaticBarriers)
         {
             for (IBindingSet* bindingSet : state.bindings)
@@ -3424,20 +3497,15 @@ namespace nvrhi::metal3
                 m_Context.warning("[metal3-trace] dispatch skipped: compute state invalid");
             return;
         }
-        id<MTLComputeCommandEncoder> encoder = getOrCreateComputeEncoder();
+        if (!m_ComputeEncoder || m_BindingStatesDirty)
+            setComputeState(m_CurrentComputeState);
+        id<MTLComputeCommandEncoder> encoder = m_ComputeEncoder;
         auto* pipeline = static_cast<ComputePipeline*>(m_CurrentComputeState.pipeline);
         if (!encoder || !pipeline)
         {
             if (traceMetalRuntime())
                 m_Context.warning("[metal3-trace] dispatch skipped: encoder/pipeline missing");
             return;
-        }
-        if (m_BindingStatesDirty)
-        {
-            setComputeState(m_CurrentComputeState);
-            encoder = m_ComputeEncoder;
-            if (!encoder)
-                return;
         }
         MTLSize threadsPerGroup = pipeline->threadsPerGroup;
         [encoder dispatchThreadgroups:MTLSizeMake(groupsX, groupsY, groupsZ) threadsPerThreadgroup:threadsPerGroup];
@@ -3664,8 +3732,9 @@ namespace nvrhi::metal3
         const MetalStageBindingPlan& plan, MTLRenderStages stages)
     {
         bool bound[2]{};
-        for (IBindingSet* bindingSet : bindingSets)
+        for (size_t bindingIndex = 0; bindingIndex < bindingSets.size(); ++bindingIndex)
         {
+            IBindingSet* bindingSet = bindingSets[bindingIndex];
             if (!bindingSet || bindingSet->getDesc())
                 continue;
             auto* table = static_cast<DescriptorTable*>(bindingSet);
@@ -3674,6 +3743,11 @@ namespace nvrhi::metal3
                 continue;
             const bool sampler = isSamplerTable(desc);
             const bool direct = sampler ? plan.directlyIndexedSamplerHeap : plan.directlyIndexedResourceHeap;
+            if (!direct && std::none_of(plan.descriptorTables.begin(), plan.descriptorTables.end(),
+                [bindingIndex](const MscDescriptorTable& reflectedTable) {
+                    return reflectedTable.descriptorCount == 0 && reflectedTable.layoutIndex == bindingIndex;
+                }))
+                continue;
             if (direct)
             {
                 if (bound[sampler])
@@ -3710,8 +3784,9 @@ namespace nvrhi::metal3
         const MetalStageBindingPlan& plan)
     {
         bool bound[2]{};
-        for (IBindingSet* bindingSet : bindingSets)
+        for (size_t bindingIndex = 0; bindingIndex < bindingSets.size(); ++bindingIndex)
         {
+            IBindingSet* bindingSet = bindingSets[bindingIndex];
             if (!bindingSet || bindingSet->getDesc())
                 continue;
             auto* table = static_cast<DescriptorTable*>(bindingSet);
@@ -3720,6 +3795,11 @@ namespace nvrhi::metal3
                 continue;
             const bool sampler = isSamplerTable(desc);
             const bool direct = sampler ? plan.directlyIndexedSamplerHeap : plan.directlyIndexedResourceHeap;
+            if (!direct && std::none_of(plan.descriptorTables.begin(), plan.descriptorTables.end(),
+                [bindingIndex](const MscDescriptorTable& reflectedTable) {
+                    return reflectedTable.descriptorCount == 0 && reflectedTable.layoutIndex == bindingIndex;
+                }))
+                continue;
             if (direct)
             {
                 if (bound[sampler])
