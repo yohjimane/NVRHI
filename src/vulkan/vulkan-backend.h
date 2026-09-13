@@ -202,6 +202,7 @@ namespace nvrhi::vulkan
 
         std::vector<RefCountPtr<IResource>> referencedResources; // to keep them alive
         std::vector<RefCountPtr<Buffer>> referencedStagingBuffers; // to allow synchronous mapBuffer
+        std::vector<RefCountPtr<TimerQuery>> timerQueries;
 
         uint64_t recordingID = 0;
         uint64_t submissionID = 0;
@@ -713,6 +714,8 @@ namespace nvrhi::vulkan
         bool started = false;
         bool resolved = false;
         float time = 0.f;
+        CommandQueue queue = CommandQueue::Graphics;
+        std::atomic<uint64_t> submissionID{ 0 };
 
         explicit TimerQuery(utils::BitSetAllocator& allocator)
             : m_QueryAllocator(allocator)

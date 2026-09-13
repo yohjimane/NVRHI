@@ -164,6 +164,11 @@ namespace nvrhi::vulkan
             }
 
             commandBuffer->submissionID = submissionID;
+            for (const auto& query : commandBuffer->timerQueries)
+            {
+                query->queue = m_QueueID;
+                query->submissionID.store(submissionID, std::memory_order_release);
+            }
             lifetimeTracker->push(commandBuffer);
 
             for (const auto& buffer : commandBuffer->referencedStagingBuffers)
@@ -354,6 +359,7 @@ namespace nvrhi::vulkan
             {
                 cmd->referencedResources.clear();
                 cmd->referencedStagingBuffers.clear();
+                cmd->timerQueries.clear();
                 cmd->submissionID = 0;
                 releasedCmdBufs.push_back(cmd);
 

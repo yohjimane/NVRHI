@@ -124,6 +124,7 @@ namespace nvrhi::vulkan
         assert(m_CurrentCmdBuf);
 
         query->resolved = false;
+        query->submissionID.store(0, std::memory_order_relaxed);
 
         m_CurrentCmdBuf->cmdBuf.resetQueryPool(m_Device->getTimerQueryPool(), query->beginQueryIndex, 2);
         m_CurrentCmdBuf->cmdBuf.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, m_Device->getTimerQueryPool(), query->beginQueryIndex);
@@ -142,6 +143,7 @@ namespace nvrhi::vulkan
         assert(m_CurrentCmdBuf);
 
         m_CurrentCmdBuf->cmdBuf.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, m_Device->getTimerQueryPool(), query->endQueryIndex);
+        m_CurrentCmdBuf->timerQueries.push_back(query);
         query->started = true;
     }
 
@@ -158,6 +160,10 @@ namespace nvrhi::vulkan
         {
             return true;
         }
+        const uint64_t submissionID = query->submissionID.load(std::memory_order_acquire);
+        if (submissionID == 0 || queueGetCompletedInstance(query->queue) < submissionID)
+            return false;
+
 
         uint32_t timestamps[2] = { 0, 0 };
 
@@ -207,6 +213,7 @@ namespace nvrhi::vulkan
         query->started = false;
         query->resolved = false;
         query->time = 0.f;
+        query->submissionID.store(0, std::memory_order_relaxed);
     }
 
 

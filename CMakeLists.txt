@@ -44,6 +44,7 @@ cmake_dependent_option(NVRHI_WITH_DX12 "Build the NVRHI D3D12 backend" ON "WIN32
 option(NVRHI_WITH_METAL3 "Build the NVRHI Metal 3 backend" OFF)
 cmake_dependent_option(NVRHI_METAL3_WITH_TRACY "Enable Tracy GPU timestamp instrumentation in the Metal 3 backend" OFF "NVRHI_WITH_METAL3" OFF)
 cmake_dependent_option(NVRHI_METAL3_BUILD_TESTS "Build native Metal command-list contract tests" OFF "NVRHI_WITH_METAL3" OFF)
+cmake_dependent_option(NVRHI_VULKAN_BUILD_TESTS "Build Vulkan timer query contract tests" OFF "NVRHI_WITH_VULKAN" OFF)
 
 
 if(NVRHI_WITH_VULKAN)
@@ -471,6 +472,19 @@ if (NVRHI_WITH_VULKAN)
         target_link_libraries(${nvrhi_vulkan_target} PUBLIC aftermath)
     endif()
     target_compile_definitions(${nvrhi_vulkan_target} PRIVATE NVRHI_WITH_AFTERMATH=$<BOOL:${NVRHI_WITH_AFTERMATH}>)
+
+    if(NVRHI_VULKAN_BUILD_TESTS)
+        enable_testing()
+        set(NVRHI_VULKAN_TEST_LIBRARY "" CACHE FILEPATH "Vulkan library used by timer query tests")
+        add_executable(nvrhi_vulkan_timer_query_tests tests/vulkan-timer-queries.cpp)
+        target_compile_features(nvrhi_vulkan_timer_query_tests PRIVATE cxx_std_17)
+        target_link_libraries(nvrhi_vulkan_timer_query_tests PRIVATE nvrhi ${nvrhi_vulkan_headers_target} ${CMAKE_DL_LIBS})
+        if(NOT NVRHI_BUILD_SHARED)
+            target_link_libraries(nvrhi_vulkan_timer_query_tests PRIVATE nvrhi_vk)
+        endif()
+        add_test(NAME nvrhi_vulkan_timer_queries COMMAND nvrhi_vulkan_timer_query_tests "${NVRHI_VULKAN_TEST_LIBRARY}")
+        set_tests_properties(nvrhi_vulkan_timer_queries PROPERTIES TIMEOUT 30)
+    endif()
 endif()
 
 if (NVRHI_WITH_METAL3)
