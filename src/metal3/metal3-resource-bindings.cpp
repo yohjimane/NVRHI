@@ -424,6 +424,12 @@ namespace nvrhi::metal3
             {
                 encodeMetalBindingResource(encoded + index, entries[index]);
                 result->entries.push_back(entries[index]);
+                if (entries[index].buffer)
+                {
+                    auto* buffer = static_cast<Buffer*>(entries[index].resource.Get());
+                    if (buffer->desc.cpuAccess != CpuAccessMode::None)
+                        result->mappableBuffers.emplace_back(buffer);
+                }
             }
         snapshot = result;
         return result;

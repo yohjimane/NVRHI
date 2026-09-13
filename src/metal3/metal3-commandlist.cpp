@@ -1101,7 +1101,12 @@ namespace nvrhi::metal3
     bool CommandList::encodeArgumentTableEntry(IRDescriptorTableEntry* entry, const MetalBindingResource& resource)
     {
         if (resource.type != ResourceType::VolatileConstantBuffer)
-            return encodeMetalBindingResource(entry, resource);
+        {
+            const bool encoded = encodeMetalBindingResource(entry, resource);
+            if (encoded && isBufferType(resource.type))
+                referenceBuffer(static_cast<IBuffer*>(resource.resource.Get()));
+            return encoded;
+        }
         auto* buffer = static_cast<Buffer*>(resource.resource.Get());
         auto allocationIt = buffer ? m_VolatileBufferAllocations.find(buffer) : m_VolatileBufferAllocations.end();
         if (allocationIt == m_VolatileBufferAllocations.end() || !allocationIt->second.allocation.buffer)
@@ -1831,6 +1836,7 @@ namespace nvrhi::metal3
         m_ReferencedNativeResources.clear();
         m_ReferencedDescriptorSnapshots.clear();
         m_ReferencedStateResources.clear();
+        m_ReferencedMappableBuffers.clear();
         m_StateTracker = CommandListResourceStateTracker(m_Context.messageCallback);
         m_PushConstantSize = 0;
         m_BindingStatesDirty = true;
@@ -2204,6 +2210,7 @@ namespace nvrhi::metal3
             return;
 
         memcpy(upload.cpuAddress, data, dataSize);
+        referenceBuffer(buffer);
 
         endEncoding();
         id<MTLBlitCommandEncoder> blit = [trackedCmdBuffer blitCommandEncoder];
@@ -2225,6 +2232,7 @@ namespace nvrhi::metal3
         const size_t clearSize = size_t(buffer->desc.byteSize);
         if (clearSize == 0)
             return;
+        referenceBuffer(buffer);
 
         if (clearValue == 0)
         {
@@ -2297,6 +2305,8 @@ namespace nvrhi::metal3
 
         if (destOffsetBytes > d->desc.byteSize || dataSizeBytes > d->desc.byteSize - destOffsetBytes)
             return;
+        referenceBuffer(d);
+        referenceBuffer(s);
 
         endEncoding();
         id<MTLBlitCommandEncoder> blit = [trackedCmdBuffer blitCommandEncoder];
@@ -2319,6 +2329,11 @@ namespace nvrhi::metal3
             m_ReferencedStateResources.emplace_back(state.pipeline);
         if (state.framebuffer)
             m_ReferencedStateResources.emplace_back(state.framebuffer);
+        for (const VertexBufferBinding& binding : state.vertexBuffers)
+            referenceBuffer(binding.buffer);
+        referenceBuffer(state.indexBuffer.buffer);
+        referenceBuffer(state.indirectParams);
+        referenceBuffer(state.indirectCountBuffer);
         if (m_EnableAutomaticBarriers)
         {
             for (IBindingSet* bindingSet : state.bindings)
@@ -3451,6 +3466,7 @@ namespace nvrhi::metal3
         m_CurrentComputeStateValid = true;
         if (state.pipeline)
             m_ReferencedStateResources.emplace_back(state.pipeline);
+        referenceBuffer(state.indirectParams);
         if (m_EnableAutomaticBarriers)
         {
             for (IBindingSet* bindingSet : state.bindings)
@@ -3652,9 +3668,7 @@ namespace nvrhi::metal3
                     continue;
                 }
                 address = snapshot->buffer.gpuAddress;
-                if (std::find(m_ReferencedDescriptorSnapshots.begin(), m_ReferencedDescriptorSnapshots.end(), snapshot) ==
-                    m_ReferencedDescriptorSnapshots.end())
-                    m_ReferencedDescriptorSnapshots.push_back(snapshot);
+                referenceDescriptorSnapshot(snapshot);
             }
             std::memcpy(static_cast<uint8_t*>(upload.cpuAddress) + table.byteOffset, &address, sizeof(address));
         }
@@ -3761,9 +3775,7 @@ namespace nvrhi::metal3
             auto snapshot = table->getSnapshot(m_Context);
             if (!snapshot)
                 continue;
-            if (std::find(m_ReferencedDescriptorSnapshots.begin(), m_ReferencedDescriptorSnapshots.end(), snapshot) ==
-                m_ReferencedDescriptorSnapshots.end())
-                m_ReferencedDescriptorSnapshots.push_back(snapshot);
+            referenceDescriptorSnapshot(snapshot);
             const NSUInteger index = sampler ? kIRSamplerHeapBindPoint : kIRDescriptorHeapBindPoint;
             if (direct)
             {
@@ -3813,9 +3825,7 @@ namespace nvrhi::metal3
             auto snapshot = table->getSnapshot(m_Context);
             if (!snapshot)
                 continue;
-            if (std::find(m_ReferencedDescriptorSnapshots.begin(), m_ReferencedDescriptorSnapshots.end(), snapshot) ==
-                m_ReferencedDescriptorSnapshots.end())
-                m_ReferencedDescriptorSnapshots.push_back(snapshot);
+            referenceDescriptorSnapshot(snapshot);
             if (direct)
                 [encoder setBuffer:snapshot->buffer offset:0 atIndex:sampler ? kIRSamplerHeapBindPoint : kIRDescriptorHeapBindPoint];
             [encoder useResource:snapshot->buffer usage:MTLResourceUsageRead];
@@ -3975,6 +3985,24 @@ namespace nvrhi::metal3
     {
         if (bindingSet && std::find(m_ReferencedBindingSets.begin(), m_ReferencedBindingSets.end(), bindingSet) == m_ReferencedBindingSets.end())
             m_ReferencedBindingSets.push_back(bindingSet);
+    }
+
+    void CommandList::referenceBuffer(IBuffer* buffer)
+    {
+        if (buffer && buffer->getDesc().cpuAccess != CpuAccessMode::None &&
+            std::find(m_ReferencedMappableBuffers.begin(), m_ReferencedMappableBuffers.end(), buffer) ==
+                m_ReferencedMappableBuffers.end())
+            m_ReferencedMappableBuffers.emplace_back(buffer);
+    }
+
+    void CommandList::referenceDescriptorSnapshot(const std::shared_ptr<DescriptorTableSnapshot>& snapshot)
+    {
+        if (std::find(m_ReferencedDescriptorSnapshots.begin(), m_ReferencedDescriptorSnapshots.end(), snapshot) !=
+            m_ReferencedDescriptorSnapshots.end())
+            return;
+        m_ReferencedDescriptorSnapshots.push_back(snapshot);
+        for (const BufferHandle& buffer : snapshot->mappableBuffers)
+            referenceBuffer(buffer);
     }
 
     void CommandList::copyTexture(IStagingTexture* dest, const TextureSlice& destSlice, ITexture* src, const TextureSlice& srcSlice)

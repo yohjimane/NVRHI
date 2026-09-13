@@ -219,6 +219,7 @@ namespace nvrhi::metal3
     {
         id<MTLBuffer> buffer = nil;
         std::vector<MetalBindingResource> entries;
+        std::vector<BufferHandle> mappableBuffers;
     };
 
     class UploadManager
@@ -375,6 +376,7 @@ namespace nvrhi::metal3
         BufferStateExtension stateExtension{desc};
         id<MTLBuffer> buffer = nil;
         bool ownsBuffer = true;
+        std::array<uint64_t, uint32_t(CommandQueue::Count)> lastUseSubmissions{};
 
         const BufferDesc& getDesc() const override { return desc; }
         GpuVirtualAddress getGpuVirtualAddress() const override { return buffer ? buffer.gpuAddress : 0; }
@@ -777,6 +779,7 @@ namespace nvrhi::metal3
         std::vector<id<MTLResource>> m_ReferencedNativeResources;
         std::vector<std::shared_ptr<DescriptorTableSnapshot>> m_ReferencedDescriptorSnapshots;
         std::vector<ResourceHandle> m_ReferencedStateResources;
+        std::vector<BufferHandle> m_ReferencedMappableBuffers;
 
         std::vector<MetalArgumentTableCacheEntry> m_ArgumentTableCache;
         uint64_t m_ArgumentTableAllocationCount = 0;
@@ -826,6 +829,8 @@ namespace nvrhi::metal3
         void applyGraphicsBindings(id<MTLRenderCommandEncoder> encoder, const GraphicsState& state);
         void applyComputeBindings(id<MTLComputeCommandEncoder> encoder, const ComputeState& state);
         void referenceBindingSet(IBindingSet* bindingSet);
+        void referenceBuffer(IBuffer* buffer);
+        void referenceDescriptorSnapshot(const std::shared_ptr<DescriptorTableSnapshot>& snapshot);
 #if defined(NVRHI_METAL3_WITH_TRACY) && defined(TRACY_ENABLE)
         tracy::SourceLocationData* getOrCreateTracySourceLocation();
         void beginTracyRenderEncoderZone(MTLRenderPassDescriptor* desc);

@@ -347,6 +347,36 @@ namespace nvrhi::metal3
             return nullptr;
         }
 
+        std::array<uint64_t, uint32_t(CommandQueue::Count)> submissions;
+        std::array<id<MTLCommandBuffer>, uint32_t(CommandQueue::Count)> commands{};
+        {
+            std::lock_guard<std::mutex> lock(m_Mutex);
+            submissions = buffer->lastUseSubmissions;
+            updateCompletedSubmissions();
+            for (uint32_t index = 0; index < uint32_t(CommandQueue::Count); ++index)
+            {
+                const QueueState& queue = m_Queues[index];
+                if (submissions[index] <= queue.completed)
+                    continue;
+                for (const SubmittedCommandBuffer& submitted : queue.pending)
+                {
+                    if (submitted.instance == submissions[index] && submitted.lastInBatch)
+                    {
+                        commands[index] = submitted.commandBuffer;
+                        break;
+                    }
+                }
+            }
+        }
+        for (id<MTLCommandBuffer> commandBuffer : commands)
+            [commandBuffer waitUntilCompleted];
+        {
+            std::lock_guard<std::mutex> lock(m_Mutex);
+            updateCompletedSubmissions();
+            if (!submissionsSucceeded(submissions))
+                return nullptr;
+        }
+
         return [buffer->buffer contents];
     }
 
@@ -718,6 +748,8 @@ namespace nvrhi::metal3
             auto* commandList = static_cast<CommandList*>(
                 pCommandLists[index]->getNativeObject(ObjectTypes::Nvrhi_Metal3_CommandList).pointer);
             queue.pending.push_back({commandList->trackedCmdBuffer, instance, index + 1 == numCommandLists});
+            for (const BufferHandle& buffer : commandList->m_ReferencedMappableBuffers)
+                static_cast<Buffer*>(buffer.Get())->lastUseSubmissions[uint32_t(executionQueue)] = instance;
             commandList->submit();
         }
         return instance;

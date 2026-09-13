@@ -242,6 +242,153 @@ namespace
         ~Gate() { event.signaledValue = 1; }
     };
 
+    struct MapGateRelease
+    {
+        Gate& gate;
+        std::atomic<bool> mapped{false};
+        std::atomic<bool> expired{false};
+        std::thread worker;
+
+        MapGateRelease(Gate& gate, std::chrono::milliseconds timeout) : gate(gate), worker([this, timeout] {
+            @autoreleasepool
+            {
+                const auto deadline = std::chrono::steady_clock::now() + timeout;
+                while (!mapped.load())
+                {
+                    if (std::chrono::steady_clock::now() >= deadline)
+                    {
+                        expired = true;
+                        break;
+                    }
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                }
+                this->gate.event.signaledValue = 1;
+            }
+        })
+        {
+        }
+
+        void finish()
+        {
+            mapped = true;
+            if (worker.joinable())
+                worker.join();
+        }
+
+        ~MapGateRelease() { finish(); }
+    };
+
+    void blockingReadMaps()
+    {
+        Fixture f;
+        nvrhi::BufferDesc sourceDesc;
+        sourceDesc.byteSize = sizeof(uint32_t);
+        auto source = f.device->createBuffer(sourceDesc);
+        require(source != nullptr, "Map read source creation failed");
+        for (auto queue : {nvrhi::CommandQueue::Graphics, nvrhi::CommandQueue::Compute, nvrhi::CommandQueue::Copy})
+        {
+            f.words[0] = 0x55555555u;
+            Gate gate(f.desc.pDevice);
+            id<MTLCommandBuffer> blocker = [f.desc.commonQueue commandBuffer];
+            [blocker encodeWaitForEvent:gate.event value:1];
+            [blocker commit];
+            auto commands = f.list(false, queue);
+            commands->open();
+            commands->setEnableAutomaticBarriers(false);
+            const uint32_t expected = 0x12345678u;
+            commands->writeBuffer(source, &expected, sizeof(expected));
+            commands->copyBuffer(f.buffer, 0, source, 0, sizeof(expected));
+            commands->close();
+            f.execute(commands, queue);
+            MapGateRelease release(gate, std::chrono::milliseconds(100));
+            auto mapped = static_cast<const uint32_t*>(f.device->mapBuffer(f.buffer, nvrhi::CpuAccessMode::Read));
+            require(mapped != nullptr, "Read mapping failed");
+            const uint32_t observed = mapped[0];
+            f.device->unmapBuffer(f.buffer);
+            release.finish();
+            require(observed == expected, "Read mapping returned stale data before its submitted copy completed");
+        }
+        f.checkErrors();
+    }
+
+    void blockingWriteMaps()
+    {
+        Fixture f;
+        nvrhi::BufferDesc sourceDesc;
+        sourceDesc.byteSize = sizeof(uint32_t);
+        sourceDesc.cpuAccess = nvrhi::CpuAccessMode::Write;
+        auto source = f.device->createBuffer(sourceDesc);
+        require(source != nullptr, "Map write source creation failed");
+        auto initial = static_cast<uint32_t*>(f.device->mapBuffer(source, nvrhi::CpuAccessMode::Write));
+        require(initial != nullptr, "Initial write mapping failed");
+        *initial = 0x12345678u;
+        f.device->unmapBuffer(source);
+        Gate gate(f.desc.pDevice);
+        id<MTLCommandBuffer> blocker = [f.desc.commonQueue commandBuffer];
+        [blocker encodeWaitForEvent:gate.event value:1];
+        [blocker commit];
+        auto commands = f.list(false, nvrhi::CommandQueue::Copy);
+        commands->open();
+        commands->copyBuffer(f.buffer, 0, source, 0, sizeof(uint32_t));
+        commands->close();
+        f.execute(commands, nvrhi::CommandQueue::Copy);
+        MapGateRelease release(gate, std::chrono::milliseconds(100));
+        auto mapped = static_cast<uint32_t*>(f.device->mapBuffer(source, nvrhi::CpuAccessMode::Write));
+        require(mapped != nullptr, "Write mapping failed");
+        *mapped = 0xabcdef01u;
+        f.device->unmapBuffer(source);
+        release.finish();
+        auto result = static_cast<const uint32_t*>(f.device->mapBuffer(f.buffer, nvrhi::CpuAccessMode::Read));
+        require(result != nullptr, "GPU read result mapping failed");
+        const uint32_t observed = *result;
+        f.device->unmapBuffer(f.buffer);
+        require(observed == 0x12345678u, "Write mapping overwrote data before its submitted GPU read completed");
+        f.checkErrors();
+    }
+
+    void mapsIgnoreUnsubmittedAndUnrelatedWork()
+    {
+        Fixture f;
+        auto completed = f.list(false, nvrhi::CommandQueue::Copy);
+        f.record(completed, 0x12345678u);
+        f.execute(completed, nvrhi::CommandQueue::Copy);
+        auto query = f.device->createEventQuery();
+        f.device->setEventQuery(query, nvrhi::CommandQueue::Copy);
+        f.device->waitEventQuery(query);
+        Gate gate(f.desc.pDevice);
+        id<MTLCommandBuffer> blocker = [f.desc.commonQueue commandBuffer];
+        [blocker encodeWaitForEvent:gate.event value:1];
+        [blocker commit];
+        nvrhi::BufferDesc unrelatedDesc;
+        unrelatedDesc.byteSize = sizeof(uint32_t);
+        unrelatedDesc.cpuAccess = nvrhi::CpuAccessMode::Read;
+        auto unrelated = f.device->createBuffer(unrelatedDesc);
+        require(unrelated != nullptr, "Unrelated map buffer creation failed");
+        auto later = f.list(false, nvrhi::CommandQueue::Compute);
+        later->open();
+        const uint32_t value = 0xabcdef01u;
+        later->writeBuffer(unrelated, &value, sizeof(value));
+        later->close();
+        f.execute(later, nvrhi::CommandQueue::Compute);
+        auto discarded = f.list();
+        f.record(discarded, 0xdeadbeefu);
+        discarded->open();
+        discarded->close();
+        f.execute(discarded);
+        auto unsubmitted = f.list();
+        f.record(unsubmitted, 0xcafebabeu);
+        MapGateRelease release(gate, std::chrono::seconds(2));
+        auto mapped = static_cast<const uint32_t*>(f.device->mapBuffer(f.buffer, nvrhi::CpuAccessMode::Read));
+        require(mapped != nullptr, "Completed buffer mapping failed");
+        const uint32_t observed = *mapped;
+        const bool laterStillBlocked = gate.event.signaledValue == 0;
+        f.device->unmapBuffer(f.buffer);
+        release.finish();
+        require(!release.expired && laterStillBlocked, "Mapping a completed buffer waited for unrelated or unsubmitted work");
+        require(observed == 0x12345678u, "Discarded or unsubmitted work changed mapped data");
+        f.checkErrors();
+    }
+
     void timerQueries()
     {
         Fixture f;
@@ -1392,6 +1539,9 @@ int main()
             immediateRules();
             discardedRecording();
             inFlightReuse();
+            blockingReadMaps();
+            blockingWriteMaps();
+            mapsIgnoreUnsubmittedAndUnrelatedWork();
             eventRearm();
             queueDependencies();
             simultaneousWaiters();
