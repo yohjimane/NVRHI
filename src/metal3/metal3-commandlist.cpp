@@ -981,20 +981,20 @@ namespace nvrhi::metal3
     {
         MetalArgumentTableCacheKey key;
         key.plan = &plan;
-        key.bindingSets.reserve(bindingSets.size());
-        key.bindingSetVersions.reserve(bindingSets.size());
+        key.bindingSetCount = bindingSets.size();
 
-        for (IBindingSet* bindingSet : bindingSets)
+        for (size_t index = 0; index < bindingSets.size(); ++index)
         {
-            key.bindingSets.push_back(bindingSet);
+            IBindingSet* bindingSet = bindingSets[index];
+            key.bindingSets[index] = bindingSet;
             if (bindingSet && !bindingSet->getDesc())
             {
                 auto* table = static_cast<DescriptorTable*>(bindingSet);
                 std::lock_guard<std::mutex> lock(table->mutex);
-                key.bindingSetVersions.push_back(table->version);
+                key.bindingSetVersions[index] = table->version;
             }
             else
-                key.bindingSetVersions.push_back(bindingSet ? static_cast<BindingSet*>(bindingSet)->version : 0);
+                key.bindingSetVersions[index] = bindingSet ? static_cast<BindingSet*>(bindingSet)->version : 0;
         }
 
         return key;
@@ -1848,6 +1848,7 @@ namespace nvrhi::metal3
         m_ArgumentTableAllocationCount = 0;
         m_ArgumentTablePageCountAtOpen = m_ArgumentTableManager.getChunkCount();
         m_VolatileBufferAllocations.clear();
+        m_VolatileBufferWriteVersion = 0;
         m_CurrentGraphicsStateValid = false;
         m_CurrentComputeStateValid = false;
         m_GeometryEmulationDrawStateValid = false;
@@ -2196,6 +2197,7 @@ namespace nvrhi::metal3
             VolatileBufferAllocation record;
             record.allocation = allocation;
             record.writtenSize = buffer->desc.byteSize;
+            record.version = ++m_VolatileBufferWriteVersion;
             m_VolatileBufferAllocations[buffer] = record;
             m_BindingStatesDirty = true;
             return;
@@ -3710,18 +3712,33 @@ namespace nvrhi::metal3
             return allocation;
         }
 
+        uint64_t volatileBufferVersion = 0;
         for (const MetalBindingPlanEntry& entry : plan.entries)
         {
             const MetalBindingResource* resource = findArgumentTableResource(bindingSets, entry);
-            if (resource && resource->type == ResourceType::VolatileConstantBuffer)
+            if (!resource || resource->type != ResourceType::VolatileConstantBuffer)
+                continue;
+            auto* buffer = static_cast<Buffer*>(resource->resource.Get());
+            const auto current = m_VolatileBufferAllocations.find(buffer);
+            if (current == m_VolatileBufferAllocations.end() || !current->second.allocation.buffer)
                 return createArgumentTable(plan, bindingSets);
+            volatileBufferVersion = std::max(volatileBufferVersion, current->second.version);
         }
 
         MetalArgumentTableCacheKey key = makeArgumentTableCacheKey(plan, bindingSets);
-        for (const MetalArgumentTableCacheEntry& entry : m_ArgumentTableCache)
+        for (MetalArgumentTableCacheEntry& entry : m_ArgumentTableCache)
         {
-            if (entry.key == key)
-                return entry.allocation;
+            if (!(entry.key == key))
+                continue;
+            if (entry.volatileBufferVersion != volatileBufferVersion)
+            {
+                allocation = createArgumentTable(plan, bindingSets);
+                if (!allocation.buffer)
+                    return allocation;
+                entry.allocation = allocation;
+                entry.volatileBufferVersion = volatileBufferVersion;
+            }
+            return entry.allocation;
         }
 
         allocation = createArgumentTable(plan, bindingSets);
@@ -3731,6 +3748,7 @@ namespace nvrhi::metal3
         MetalArgumentTableCacheEntry entry;
         entry.key = std::move(key);
         entry.allocation = allocation;
+        entry.volatileBufferVersion = volatileBufferVersion;
         m_ArgumentTableCache.push_back(std::move(entry));
         return allocation;
     }

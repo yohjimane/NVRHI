@@ -613,7 +613,7 @@ namespace
         require(SUCCEEDED(result->GetStatus(&status)) && SUCCEEDED(status), "Indirect regression shader is invalid");
         nvrhi::RefCountPtr<IDxcBlob> bytes;
         require(SUCCEEDED(result->GetResult(bytes.GetAddressOf())), "Indirect regression shader bytecode missing");
-        auto shader = device->createShader(nvrhi::ShaderDesc(type).setEntryName(entry),
+        auto shader = device->createShader(nvrhi::ShaderDesc().setShaderType(type).setEntryName(entry),
             bytes->GetBufferPointer(), bytes->GetBufferSize());
         require(shader != nullptr, "Indirect regression shader creation failed");
         return shader;
@@ -874,6 +874,156 @@ namespace
         for (unsigned index = 0; index < 3; ++index)
             require(std::memcmp(f.words + index * 64, expected, sizeof(expected)) == 0,
                 "Fragment timer instrumentation lost blended fullscreen draws");
+        f.checkErrors();
+    }
+
+    void volatileArgumentTableSnapshots()
+    {
+        Fixture f;
+        nvrhi::RefCountPtr<IDxcCompiler3> compiler;
+        require(SUCCEEDED(DxcCreateInstance(CLSID_DxcCompiler, IID_PPV_ARGS(compiler.GetAddressOf()))),
+            "DXC compiler creation failed");
+        const char* source =
+            "cbuffer First : register(b0) { uint first; uint retained; };"
+            "cbuffer Second : register(b1) { uint second; };"
+            "Texture2D<uint> textures[] : register(t0, space1);"
+            "RWByteAddressBuffer output : register(u0);"
+            "[numthreads(1, 1, 1)] void csMain() {"
+            "uint slot; output.InterlockedAdd(0, 1, slot);"
+            "output.Store4((slot + 1) * 16, uint4(first, retained, second, textures[3].Load(int3(0, 0, 0)))); }";
+        auto layout = f.device->createBindingLayout(nvrhi::BindingLayoutDesc()
+            .setVisibility(nvrhi::ShaderType::Compute)
+            .addItem(nvrhi::BindingLayoutItem::VolatileConstantBuffer(1))
+            .addItem(nvrhi::BindingLayoutItem::RawBuffer_UAV(0))
+            .addItem(nvrhi::BindingLayoutItem::VolatileConstantBuffer(2))
+            .addItem(nvrhi::BindingLayoutItem::VolatileConstantBuffer(0)));
+        nvrhi::BindlessLayoutDesc heapDesc;
+        heapDesc.visibility = nvrhi::ShaderType::Compute;
+        heapDesc.maxCapacity = 4;
+        heapDesc.registerSpaces = {nvrhi::BindingLayoutItem::Texture_SRV(1)};
+        auto heapLayout = f.device->createBindlessLayout(heapDesc);
+        auto heap = f.device->createDescriptorTable(heapLayout);
+        require(layout != nullptr && heap != nullptr, "Volatile snapshot layout creation failed");
+        f.device->resizeDescriptorTable(heap, heapDesc.maxCapacity, false);
+        auto shader = compileRegressionShader(f.device, compiler, source, nvrhi::ShaderType::Compute);
+        auto pipeline = f.device->createComputePipeline(nvrhi::ComputePipelineDesc()
+            .setComputeShader(shader).addBindingLayout(layout).addBindingLayout(heapLayout));
+        require(pipeline != nullptr, "Volatile snapshot pipeline creation failed");
+        nvrhi::BufferDesc constantsDesc;
+        constantsDesc.byteSize = 512;
+        constantsDesc.isConstantBuffer = constantsDesc.isVolatile = true;
+        auto first = f.device->createBuffer(constantsDesc);
+        auto second = f.device->createBuffer(constantsDesc);
+        auto unused = f.device->createBuffer(constantsDesc);
+        require(first != nullptr && second != nullptr && unused != nullptr, "Volatile snapshot constants creation failed");
+        const uint32_t expected[][4] = {
+            {12, 70, 1, 17}, {12, 70, 1, 17}, {12, 70, 2, 17}, {12, 70, 3, 17},
+            {12, 71, 3, 17}, {12, 71, 3, 17}, {12, 71, 3, 17}, {12, 71, 3, 29},
+            {12, 71, 3, 29}, {12, 71, 3, 29}, {40, 80, 4, 29}, {40, 80, 5, 29},
+            {40, 80, 5, 29}
+        };
+        nvrhi::BufferDesc outputDesc;
+        outputDesc.byteSize = sizeof(expected) + 16;
+        outputDesc.cpuAccess = nvrhi::CpuAccessMode::Read;
+        outputDesc.canHaveUAVs = outputDesc.canHaveRawViews = true;
+        outputDesc.initialState = nvrhi::ResourceStates::UnorderedAccess;
+        outputDesc.keepInitialState = true;
+        auto output = f.device->createBuffer(outputDesc);
+        require(output != nullptr, "Volatile snapshot output creation failed");
+        id<MTLBuffer> native = (__bridge id<MTLBuffer>)output->getNativeObject(nvrhi::ObjectTypes::MTL3_Buffer).pointer;
+        require(native.contents != nullptr, "Volatile snapshot output mapping failed");
+        std::memset(native.contents, 0x55, outputDesc.byteSize);
+        *static_cast<uint32_t*>(native.contents) = 0;
+        nvrhi::BindingSetDesc bindings;
+        bindings.bindings = {
+            nvrhi::BindingSetItem::ConstantBuffer(2, unused),
+            nvrhi::BindingSetItem::ConstantBuffer(0, first, nvrhi::BufferRange(256, 256)),
+            nvrhi::BindingSetItem::RawBuffer_UAV(0, output),
+            nvrhi::BindingSetItem::ConstantBuffer(1, second)
+        };
+        auto set = f.device->createBindingSet(bindings, layout);
+        require(set != nullptr, "Volatile snapshot binding set creation failed");
+        nvrhi::TextureDesc textureDesc;
+        textureDesc.width = textureDesc.height = 1;
+        textureDesc.format = nvrhi::Format::R32_UINT;
+        textureDesc.initialState = nvrhi::ResourceStates::ShaderResource;
+        textureDesc.keepInitialState = true;
+        std::array<nvrhi::TextureHandle, 2> textures;
+        const uint32_t texels[] = {17, 29};
+        auto uploads = f.list();
+        uploads->open();
+        for (unsigned index = 0; index < textures.size(); ++index)
+        {
+            textures[index] = f.device->createTexture(textureDesc);
+            require(textures[index] != nullptr, "Volatile snapshot texture creation failed");
+            uploads->writeTexture(textures[index], 0, 0, &texels[index], sizeof(uint32_t));
+        }
+        uploads->close();
+        f.execute(uploads);
+        f.device->waitForIdle();
+        require(f.device->writeDescriptorTable(heap, nvrhi::BindingSetItem::Texture_SRV(3, textures[0])),
+            "Volatile snapshot descriptor write failed");
+        Gate gate(f.desc.pDevice);
+        id<MTLCommandBuffer> blocker = [f.desc.commonQueue commandBuffer];
+        [blocker encodeWaitForEvent:gate.event value:1];
+        [blocker commit];
+        auto commands = f.list();
+        nvrhi::ComputeState state;
+        state.pipeline = pipeline;
+        state.bindings = {set, heap};
+        auto dispatch = [&] {
+            commands->setComputeState(state);
+            commands->dispatch(1);
+        };
+        auto writeWord = [&](nvrhi::IBuffer* buffer, uint32_t value, uint64_t offset = 0) {
+            commands->writeBuffer(buffer, &value, sizeof(value), offset);
+        };
+        std::array<uint32_t, 128> values{};
+        values[64] = 10;
+        values[65] = 70;
+        commands->open();
+        commands->writeBuffer(first, values.data(), sizeof(values));
+        writeWord(second, 1);
+        writeWord(first, 11, 256);
+        writeWord(first, 12, 256);
+        dispatch();
+        dispatch();
+        writeWord(second, 2);
+        dispatch();
+        writeWord(second, 3);
+        dispatch();
+        writeWord(first, 71, 260);
+        dispatch();
+        writeWord(unused, 999);
+        dispatch();
+        writeWord(f.buffer, 0x12345678u, 4092);
+        commands->dispatch(1);
+        require(f.device->writeDescriptorTable(heap, nvrhi::BindingSetItem::Texture_SRV(3, textures[1])),
+            "Volatile snapshot descriptor replacement failed");
+        dispatch();
+        dispatch();
+        writeWord(first, 71, 260);
+        dispatch();
+        commands->close();
+        f.execute(commands);
+        values[64] = 40;
+        values[65] = 80;
+        commands->open();
+        commands->writeBuffer(first, values.data(), sizeof(values));
+        writeWord(second, 4);
+        dispatch();
+        writeWord(second, 5);
+        dispatch();
+        dispatch();
+        commands->close();
+        f.execute(commands);
+        commands = nullptr;
+        require(static_cast<const uint32_t*>(native.contents)[4] == 0x55555555u, "Volatile snapshot GPU gate did not hold");
+        gate.event.signaledValue = 1;
+        f.device->waitForIdle();
+        require(std::memcmp(static_cast<const uint32_t*>(native.contents) + 4, expected, sizeof(expected)) == 0,
+            "Volatile argument tables lost a dispatch, partial write, descriptor snapshot, or in-flight recording");
+        require(f.words[1023] == 0x12345678u, "Volatile snapshot encoder interruption lost its buffer write");
         f.checkErrors();
     }
 
@@ -1553,6 +1703,7 @@ int main()
             textureViewResults();
             uavTextureClears();
             sparseDescriptorSnapshots();
+            volatileArgumentTableSnapshots();
             interruptedIndirectDraws();
             countedIndirectBindings();
             unsupportedCapabilities();

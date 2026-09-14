@@ -122,12 +122,14 @@ namespace nvrhi::metal3
     struct MetalArgumentTableCacheKey
     {
         const MetalStageBindingPlan* plan = nullptr;
-        std::vector<const IBindingSet*> bindingSets;
-        std::vector<uint64_t> bindingSetVersions;
+        size_t bindingSetCount = 0;
+        std::array<const IBindingSet*, c_MaxBindingLayouts> bindingSets{};
+        std::array<uint64_t, c_MaxBindingLayouts> bindingSetVersions{};
 
         bool operator==(const MetalArgumentTableCacheKey& other) const
         {
             return plan == other.plan &&
+                bindingSetCount == other.bindingSetCount &&
                 bindingSets == other.bindingSets &&
                 bindingSetVersions == other.bindingSetVersions;
         }
@@ -144,6 +146,7 @@ namespace nvrhi::metal3
     {
         MetalArgumentTableCacheKey key;
         ArgumentTableAllocation allocation;
+        uint64_t volatileBufferVersion = 0;
     };
 
     // implementation in metal3-constants.cpp
@@ -190,6 +193,7 @@ namespace nvrhi::metal3
     {
         UploadAllocation allocation;
         size_t writtenSize = 0;
+        uint64_t version = 0;
     };
 
     // metal resource cache per nvrhi binding item
@@ -788,6 +792,7 @@ namespace nvrhi::metal3
         std::array<uint8_t, c_MaxPushConstantSize> m_PushConstants{};
         size_t m_PushConstantSize = 0;
         std::unordered_map<Buffer*, VolatileBufferAllocation> m_VolatileBufferAllocations;
+        uint64_t m_VolatileBufferWriteVersion = 0;
         std::vector<NSString*> m_DebugGroups;
 
         TracyGpuScopeDesc m_TracyGpuScope;
