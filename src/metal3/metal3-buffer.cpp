@@ -21,7 +21,7 @@ namespace nvrhi::metal3
         if (d.isVolatile)
             return BufferHandle::Create(buffer);
 
-        MTLResourceOptions options = convertCpuAccess(d.cpuAccess);
+        MTLResourceOptions options = convertCpuAccess(d.cpuAccess) | MTLResourceHazardTrackingModeUntracked;
         buffer->buffer = [m_Context.device newBufferWithLength:NSUInteger(d.byteSize) options:options];
         if (!buffer->buffer)
         {
@@ -33,7 +33,15 @@ namespace nvrhi::metal3
         if (!d.debugName.empty())
             buffer->buffer.label = [NSString stringWithUTF8String:d.debugName.c_str()];
 
+        buffer->residency = m_Context.residency;
+        m_Context.residency->add(buffer->buffer);
         return BufferHandle::Create(buffer);
+    }
+
+    Buffer::~Buffer()
+    {
+        if (residency && buffer)
+            residency->remove(buffer);
     }
 
     Object Buffer::getNativeObject(ObjectType objectType)

@@ -73,6 +73,7 @@ namespace nvrhi::metal3
         
         // always create private textures, fill them using command lists if CPU data needs be written
         td.storageMode = MTLStorageModePrivate;
+        td.hazardTrackingMode = MTLHazardTrackingModeUntracked;
 
         MTLSizeAndAlign sizeAndAlign = [m_Context.device heapTextureSizeAndAlignWithDescriptor:td];
 
@@ -91,7 +92,15 @@ namespace nvrhi::metal3
 
         texture->desc = d;
         texture->texture = nativeTexture;
+        texture->residency = m_Context.residency;
+        m_Context.residency->add(nativeTexture);
         return TextureHandle::Create(texture);
+    }
+
+    Texture::~Texture()
+    {
+        if (residency && texture)
+            residency->remove(texture);
     }
     
     // useful to create handle for textures created with native metal3, like for swapchains, etc

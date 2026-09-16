@@ -3,6 +3,7 @@
 #include "nvrhi/common/resource.h"
 #include "nvrhi/utils.h"
 #include <Metal/Metal.h>
+#include <algorithm>
 #include <atomic>
 #include <cstdio>
 #include <limits>
@@ -29,6 +30,64 @@ namespace nvrhi::metal3
     void MTL3Context::unsupported(const char* operation) const
     {
         error(std::string("[nvrhi] Metal backend does not support ") + operation + ".");
+    }
+
+    ResidencyRegistry::ResidencyRegistry(const MTL3Context& context)
+    {
+        MTLResidencySetDescriptor* desc = [[MTLResidencySetDescriptor alloc] init];
+        desc.initialCapacity = 4096;
+        desc.label = @"nvrhi allocations";
+        NSError* error = nil;
+        m_Set = [context.device newResidencySetWithDescriptor:desc error:&error];
+        if (!m_Set)
+        {
+            context.error(std::string("[nvrhi] Failed to create the Metal residency set: ") +
+                (error ? error.localizedDescription.UTF8String : "unknown error"));
+            return;
+        }
+        for (uint32_t index = 0; index < uint32_t(CommandQueue::Count); ++index)
+        {
+            id<MTLCommandQueue> queue = context.queue(CommandQueue(index));
+            if (!queue || std::find(m_Queues.begin(), m_Queues.end(), queue) != m_Queues.end())
+                continue;
+            [queue addResidencySet:m_Set];
+            m_Queues.push_back(queue);
+        }
+    }
+
+    ResidencyRegistry::~ResidencyRegistry()
+    {
+        for (id<MTLCommandQueue> queue : m_Queues)
+            [queue removeResidencySet:m_Set];
+    }
+
+    void ResidencyRegistry::add(id<MTLAllocation> allocation)
+    {
+        if (!m_Set || !allocation)
+            return;
+        std::lock_guard<std::mutex> lock(m_Mutex);
+        [m_Set addAllocation:allocation];
+        m_Dirty = true;
+    }
+
+    void ResidencyRegistry::remove(id<MTLAllocation> allocation)
+    {
+        if (!m_Set || !allocation)
+            return;
+        std::lock_guard<std::mutex> lock(m_Mutex);
+        [m_Set removeAllocation:allocation];
+        m_Dirty = true;
+    }
+
+    void ResidencyRegistry::commit()
+    {
+        if (!m_Set)
+            return;
+        std::lock_guard<std::mutex> lock(m_Mutex);
+        if (!m_Dirty)
+            return;
+        [m_Set commit];
+        m_Dirty = false;
     }
 
     // device creation
@@ -74,7 +133,9 @@ namespace nvrhi::metal3
             m_DefaultLifetimeTrackers[index] = RefCountPtr<CommandListLifetimeTracker>::Create(
                 new CommandListLifetimeTracker(this, CommandQueue(index), true));
             m_Queues[index].event = [m_Context.device newEvent];
+            m_Queues[index].fence = [m_Context.device newFence];
         }
+        m_Context.residency = std::make_shared<ResidencyRegistry>(m_Context);
     }
 
     Device::~Device()
@@ -460,6 +521,8 @@ namespace nvrhi::metal3
         result->desc	   = desc;
         result->buffer	   = (__bridge id<MTLBuffer>)buffer.pointer;
         result->ownsBuffer = false;
+        result->residency = m_Context.residency;
+        m_Context.residency->add(result->buffer);
         return BufferHandle::Create(result);
     }
 
@@ -568,6 +631,7 @@ namespace nvrhi::metal3
         case Feature::CopyQueue:
         case Feature::ConstantBufferRanges:
         case Feature::DeferredCommandLists:
+        case Feature::Meshlets:
             return true;
         default:
             return false;
@@ -645,24 +709,6 @@ namespace nvrhi::metal3
             return MTLPixelFormatInvalid;
         }
     }
-
-
-    MeshletPipelineHandle Device::createMeshletPipeline(const MeshletPipelineDesc& desc, FramebufferInfo const& fbinfo)
-    {
-        (void)desc;
-        (void)fbinfo;
-        m_Context.unsupported(__func__);
-        return nullptr;
-    }
-
-    MeshletPipelineHandle Device::createMeshletPipeline(const MeshletPipelineDesc& desc, IFramebuffer* fb)
-    {
-        (void)desc;
-        (void)fb;
-        m_Context.unsupported(__func__);
-        return nullptr;
-    }
-
 
     rt::OpacityMicromapHandle Device::createOpacityMicromap(const rt::OpacityMicromapDesc& desc)
     {
@@ -771,6 +817,7 @@ namespace nvrhi::metal3
             [waits commit];
             queue.pendingWaits.clear();
         }
+        m_Context.residency->commit();
         for (size_t index = 0; index < numCommandLists; ++index)
         {
             auto* commandList = static_cast<CommandList*>(

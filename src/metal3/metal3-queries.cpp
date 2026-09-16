@@ -87,13 +87,14 @@ namespace nvrhi::metal3
                     return nullptr;
                 }
                 id<MTLBuffer> markers = [m_Context.device newBufferWithLength:TimerQueryPool::QueriesPerPage * sizeof(uint32_t)
-                    options:MTLResourceStorageModePrivate];
+                    options:MTLResourceStorageModePrivate | MTLResourceHazardTrackingModeUntracked];
                 if (!markers)
                 {
                     m_Context.error("[nvrhi] Cannot allocate GPU timestamp marker storage.");
                     return nullptr;
                 }
                 markers.label = @"NVRHI GPU timer markers";
+                m_Context.residency->add(markers);
                 pageIndex = emptyPageIndex;
                 if (pageIndex == pool->pages.size())
                     pool->pages.emplace_back();
@@ -189,12 +190,8 @@ namespace nvrhi::metal3
     bool CommandList::encodeTimerBoundary(TimerQuery* query, bool ending)
     {
         endEncoding();
+        flushPendingClears();
         if (m_RecordingFailed)
-            return false;
-        id<MTLFence> boundaryFence = m_TimerBoundaryFence;
-        if (!boundaryFence)
-            boundaryFence = createTimerFence();
-        if (!boundaryFence)
             return false;
         const NSUInteger firstSample = query->sampleIndex + (ending ? 2 : 0);
         MTLComputePassDescriptor* pass = [MTLComputePassDescriptor computePassDescriptor];
@@ -208,18 +205,12 @@ namespace nvrhi::metal3
             m_Context.error("[nvrhi] Cannot encode GPU timestamp boundary.");
             return false;
         }
-        annotateEncoder(encoder, ending ? "endTimerQuery" : "beginTimerQuery");
-        if (m_WorkloadCompletionFence)
-            [encoder waitForFence:m_WorkloadCompletionFence];
-        if (m_TimerBoundaryFence)
-            [encoder waitForFence:m_TimerBoundaryFence];
+        beginEncoding(encoder, ending ? "endTimerQuery" : "beginTimerQuery");
         [encoder setComputePipelineState:query->pool->markerPipeline];
         [encoder setBuffer:query->markers
             offset:(query->sampleIndex / TimerQueryPool::SamplesPerQuery) * sizeof(uint32_t) atIndex:0];
         [encoder dispatchThreads:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
-        [encoder updateFence:boundaryFence];
-        [encoder endEncoding];
-        m_TimerBoundaryFence = boundaryFence;
+        endEncoding(encoder);
         return true;
     }
 

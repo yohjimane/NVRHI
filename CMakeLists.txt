@@ -320,6 +320,7 @@ set(src_metal3_impl
     src/metal3/metal3-constants.cpp
     src/metal3/metal3-device.cpp
     src/metal3/metal3-graphics.cpp
+    src/metal3/metal3-meshlets.cpp
     src/metal3/metal3-queries.cpp
     src/metal3/metal3-raytracing.cpp
     src/metal3/metal3-resource-bindings.cpp

@@ -1,4 +1,5 @@
 #include "metal3-backend.h"
+#include <algorithm>
 
 namespace nvrhi::metal3
 {
@@ -96,7 +97,7 @@ namespace nvrhi::metal3
         const auto& bufferBarriers = m_StateTracker.getBufferBarriers();
         if (textureBarriers.empty() && bufferBarriers.empty())
             return;
-        if (m_ComputeEncoder && !m_RenderEncoder)
+        if (m_ComputeEncoder)
         {
             NSUInteger scope = 0;
             if (!bufferBarriers.empty())
@@ -105,8 +106,16 @@ namespace nvrhi::metal3
                 scope |= MTLBarrierScopeTextures;
             [m_ComputeEncoder memoryBarrierWithScope:MTLBarrierScope(scope)];
         }
-        else
-            endEncoding();
+        else if (m_RenderEncoder && !m_RenderEncoderWrites.empty())
+        {
+            bool split = false;
+            for (const TextureBarrier& barrier : textureBarriers)
+                split |= std::find(m_RenderEncoderWrites.begin(), m_RenderEncoderWrites.end(), barrier.texture) != m_RenderEncoderWrites.end();
+            for (const BufferBarrier& barrier : bufferBarriers)
+                split |= std::find(m_RenderEncoderWrites.begin(), m_RenderEncoderWrites.end(), barrier.buffer) != m_RenderEncoderWrites.end();
+            if (split)
+                endEncoding();
+        }
         m_StateTracker.clearBarriers();
     }
 

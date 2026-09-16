@@ -1,5 +1,6 @@
 #include "metal3-backend.h"
 #include <metal_irconverter_runtime/metal_irconverter_runtime.h>
+#include <algorithm>
 #include <cctype>
 
 namespace nvrhi::metal3
@@ -155,6 +156,8 @@ namespace nvrhi::metal3
         }
         if (fbinfo.depthFormat != Format::UNKNOWN)
             pd.depthAttachmentPixelFormat = convertFormat(fbinfo.depthFormat);
+        if (getFormatInfo(fbinfo.depthFormat).hasStencil)
+            pd.stencilAttachmentPixelFormat = convertFormat(fbinfo.depthFormat);
         pd.rasterSampleCount = fbinfo.sampleCount;
     }
 
@@ -309,6 +312,19 @@ namespace nvrhi::metal3
         return descriptor;
     }
 
+    static id<MTLDepthStencilState> createDepthStencilState(const MTL3Context& context, const DepthStencilState& state)
+    {
+        MTLDepthStencilDescriptor* dd = [[MTLDepthStencilDescriptor alloc] init];
+        dd.depthCompareFunction = state.depthTestEnable ? convertCompareFunction(state.depthFunc) : MTLCompareFunctionAlways;
+        dd.depthWriteEnabled = state.depthWriteEnable;
+        if (state.stencilEnable)
+        {
+            dd.frontFaceStencil = createStencilDescriptor(state.frontFaceStencil, state);
+            dd.backFaceStencil = createStencilDescriptor(state.backFaceStencil, state);
+        }
+        return [context.device newDepthStencilStateWithDescriptor:dd];
+    }
+
     GraphicsPipelineHandle Device::createGraphicsPipeline(const GraphicsPipelineDesc& desc, FramebufferInfo const& fbinfo)
     {
         auto* vs = static_cast<Shader*>(desc.VS.Get());
@@ -351,22 +367,11 @@ namespace nvrhi::metal3
             }
         }
 
-        MTLDepthStencilDescriptor* dd = [[MTLDepthStencilDescriptor alloc] init];
-        dd.depthCompareFunction = desc.renderState.depthStencilState.depthTestEnable
-            ? convertCompareFunction(desc.renderState.depthStencilState.depthFunc)
-            : MTLCompareFunctionAlways;
-        dd.depthWriteEnabled = desc.renderState.depthStencilState.depthWriteEnable;
-        if (desc.renderState.depthStencilState.stencilEnable)
-        {
-            dd.frontFaceStencil = createStencilDescriptor(desc.renderState.depthStencilState.frontFaceStencil, desc.renderState.depthStencilState);
-            dd.backFaceStencil = createStencilDescriptor(desc.renderState.depthStencilState.backFaceStencil, desc.renderState.depthStencilState);
-        }
-
         GraphicsPipeline* pipeline = new GraphicsPipeline();
         pipeline->desc = desc;
         pipeline->framebufferInfo = fbinfo;
         pipeline->pipeline = nativePipeline;
-        pipeline->depthStencilState = [m_Context.device newDepthStencilStateWithDescriptor:dd];
+        pipeline->depthStencilState = createDepthStencilState(m_Context, desc.renderState.depthStencilState);
         pipeline->primitiveType = convertPrimitiveType(desc.primType);
         pipeline->cullMode = convertCullMode(desc.renderState.rasterState.cullMode);
         pipeline->frontWinding = convertWinding(desc.renderState.rasterState.frontCounterClockwise);
@@ -391,6 +396,85 @@ namespace nvrhi::metal3
     GraphicsPipelineHandle Device::createGraphicsPipeline(const GraphicsPipelineDesc& desc, IFramebuffer* fb)
     {
         return createGraphicsPipeline(desc, fb ? FramebufferInfo(fb->getDesc()) : FramebufferInfo());
+    }
+
+    MeshletPipelineHandle Device::createMeshletPipeline(const MeshletPipelineDesc& desc, FramebufferInfo const& fbinfo)
+    {
+        auto* as = static_cast<Shader*>(desc.AS.Get());
+        auto* ms = static_cast<Shader*>(desc.MS.Get());
+        auto* ps = static_cast<Shader*>(desc.PS.Get());
+        if (!ms || !ms->function || (as && !as->function))
+        {
+            m_Context.error("[nvrhi] Metal meshlet pipelines require a mesh shader function.");
+            return nullptr;
+        }
+        if (!ms->computeThreadsPerGroupValid || (as && !as->computeThreadsPerGroupValid))
+        {
+            m_Context.error("[nvrhi] Metal meshlet pipelines require reflected thread counts for the mesh and amplification shaders.");
+            return nullptr;
+        }
+
+        id<MTLRenderPipelineState> nativePipeline = nil;
+        if (@available(macOS 14.0, *))
+        {
+            MTLMeshRenderPipelineDescriptor* pd = [[MTLMeshRenderPipelineDescriptor alloc] init];
+            pd.objectFunction = as ? as->function : nil;
+            pd.meshFunction = ms->function;
+            pd.fragmentFunction = ps ? ps->function : nil;
+            pd.supportIndirectCommandBuffers = YES;
+            pd.maxTotalThreadsPerMeshThreadgroup = ms->computeThreadsPerGroup.width *
+                ms->computeThreadsPerGroup.height * ms->computeThreadsPerGroup.depth;
+            if (as)
+            {
+                pd.maxTotalThreadsPerObjectThreadgroup = as->computeThreadsPerGroup.width *
+                    as->computeThreadsPerGroup.height * as->computeThreadsPerGroup.depth;
+                uint32_t payload = std::max(as->mscReflection.maxPayloadSizeInBytes, ms->mscReflection.maxPayloadSizeInBytes);
+                pd.payloadMemoryLength = payload ? payload : 16384;
+            }
+            applyFramebufferFormats(pd, fbinfo, desc.renderState.blendState);
+            NSError* error = nil;
+            nativePipeline = [m_Context.device newRenderPipelineStateWithMeshDescriptor:pd
+                                                                               options:MTLPipelineOptionNone
+                                                                            reflection:nil
+                                                                                 error:&error];
+            if (!nativePipeline)
+            {
+                std::string message = "[nvrhi] Failed to create Metal mesh render pipeline";
+                if (error)
+                    message += std::string(": ") + [[error localizedDescription] UTF8String];
+                m_Context.error(message);
+                return nullptr;
+            }
+        }
+        else
+        {
+            m_Context.error("[nvrhi] Metal meshlet pipelines require macOS 14.0 or newer.");
+            return nullptr;
+        }
+
+        MeshletPipeline* pipeline = new MeshletPipeline();
+        pipeline->desc = desc;
+        pipeline->framebufferInfo = fbinfo;
+        pipeline->pipeline = nativePipeline;
+        pipeline->depthStencilState = createDepthStencilState(m_Context, desc.renderState.depthStencilState);
+        pipeline->cullMode = convertCullMode(desc.renderState.rasterState.cullMode);
+        pipeline->frontWinding = convertWinding(desc.renderState.rasterState.frontCounterClockwise);
+        pipeline->hasObjectStage = as != nullptr;
+        pipeline->threadsPerMeshThreadgroup = ms->computeThreadsPerGroup;
+        if (as)
+        {
+            pipeline->threadsPerObjectThreadgroup = as->computeThreadsPerGroup;
+            pipeline->objectBindingPlan = resolveMetalStageBindingPlan(as->reflectedBindingPlan, desc.bindingLayouts);
+        }
+        pipeline->meshBindingPlan = resolveMetalStageBindingPlan(ms->reflectedBindingPlan, desc.bindingLayouts);
+        if (ps)
+            pipeline->fragmentBindingPlan = resolveMetalStageBindingPlan(ps->reflectedBindingPlan, desc.bindingLayouts);
+        return MeshletPipelineHandle::Create(pipeline);
+    }
+
+    MeshletPipelineHandle Device::createMeshletPipeline(const MeshletPipelineDesc& desc, IFramebuffer* fb)
+    {
+        return createMeshletPipeline(desc, fb ? FramebufferInfo(fb->getDesc()) : FramebufferInfo());
     }
 
     Object GraphicsPipeline::getNativeObject(ObjectType objectType)

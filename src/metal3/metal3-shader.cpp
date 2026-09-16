@@ -186,10 +186,13 @@ namespace nvrhi::metal3
         if (std::regex_search(json, match, inputPrimitiveRegex))
             reflection.inputPrimitive = match[1].str();
         
-        // parse compute threads from reflection data, *tg_size*
+        std::regex payloadRegex(R"("max_payload_size_in_bytes"\s*:\s*([0-9]+))");
+        if (std::regex_search(json, match, payloadRegex))
+            reflection.maxPayloadSizeInBytes = static_cast<uint32_t>(std::stoul(match[1].str()));
+
         if (computeThreads)
         {
-            std::regex tgSizeRegex(R"("tg_size"\s*:\s*\[\s*([0-9]+)\s*,\s*([0-9]+)\s*,\s*([0-9]+)\s*\])");
+            std::regex tgSizeRegex(R"re("(?:tg_size|num_threads)"\s*:\s*\[\s*([0-9]+)\s*,\s*([0-9]+)\s*,\s*([0-9]+)\s*\])re");
             if (std::regex_search(json, match, tgSizeRegex))
             {
                 computeThreads->width = static_cast<NSUInteger>(std::stoul(match[1].str()));
@@ -488,8 +491,10 @@ namespace nvrhi::metal3
         case ShaderType::Vertex: stage = IRShaderStageVertex; break;
         case ShaderType::Pixel: stage = IRShaderStageFragment; break;
         case ShaderType::Compute: stage = IRShaderStageCompute; break;
+        case ShaderType::Mesh: stage = IRShaderStageMesh; break;
+        case ShaderType::Amplification: stage = IRShaderStageAmplification; break;
         default:
-            context.error("[metal3] DXIL conversion supports vertex, pixel and compute shaders: " + shader.desc.debugName);
+            context.error("[metal3] DXIL conversion supports vertex, pixel, compute, mesh and amplification shaders: " + shader.desc.debugName);
             return false;
         }
         std::unique_ptr<IRRootSignature, decltype(&IRRootSignatureDestroy)> root(
@@ -588,6 +593,34 @@ namespace nvrhi::metal3
                 return false;
             }
         }
+        if (stage == IRShaderStageMesh)
+        {
+            IRVersionedMSInfo info{};
+            if (!IRShaderReflectionCopyMeshInfo(reflection.get(), IRReflectionVersion_1_0, &info))
+            {
+                context.error("[metal3] Missing MSC mesh dimensions: " + shader.desc.debugName);
+                return false;
+            }
+            shader.computeThreadsPerGroup = MTLSizeMake(info.info_1_0.num_threads[0], info.info_1_0.num_threads[1], info.info_1_0.num_threads[2]);
+            metadata.maxPayloadSizeInBytes = info.info_1_0.max_payload_size_in_bytes;
+            IRShaderReflectionReleaseMeshInfo(&info);
+            shader.computeThreadsPerGroupValid = shader.computeThreadsPerGroup.width != 0 &&
+                shader.computeThreadsPerGroup.height != 0 && shader.computeThreadsPerGroup.depth != 0;
+        }
+        if (stage == IRShaderStageAmplification)
+        {
+            IRVersionedASInfo info{};
+            if (!IRShaderReflectionCopyAmplificationInfo(reflection.get(), IRReflectionVersion_1_0, &info))
+            {
+                context.error("[metal3] Missing MSC amplification dimensions: " + shader.desc.debugName);
+                return false;
+            }
+            shader.computeThreadsPerGroup = MTLSizeMake(info.info_1_0.num_threads[0], info.info_1_0.num_threads[1], info.info_1_0.num_threads[2]);
+            metadata.maxPayloadSizeInBytes = info.info_1_0.max_payload_size_in_bytes;
+            IRShaderReflectionReleaseAmplificationInfo(&info);
+            shader.computeThreadsPerGroupValid = shader.computeThreadsPerGroup.width != 0 &&
+                shader.computeThreadsPerGroup.height != 0 && shader.computeThreadsPerGroup.depth != 0;
+        }
         metallib.resize(IRMetalLibGetBytecodeSize(library.get()));
         if (metallib.empty() || IRMetalLibGetBytecode(library.get(), metallib.data()) != metallib.size())
         {
@@ -684,7 +717,7 @@ namespace nvrhi::metal3
         }
         shader->reflectedBindingPlan = createMetalStageBindingPlan(d.shaderType, shader->mscReflection);
 
-        if (d.shaderType == ShaderType::Compute)
+        if (d.shaderType == ShaderType::Compute || d.shaderType == ShaderType::Mesh || d.shaderType == ShaderType::Amplification)
         {
             if (reflectionThreads.width != 0 && reflectionThreads.height != 0 && reflectionThreads.depth != 0)
             {
