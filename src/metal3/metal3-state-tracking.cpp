@@ -92,11 +92,22 @@ namespace nvrhi::metal3
 
     void CommandList::commitBarriers()
     {
-        if (!m_StateTracker.getTextureBarriers().empty() || !m_StateTracker.getBufferBarriers().empty())
+        const auto& textureBarriers = m_StateTracker.getTextureBarriers();
+        const auto& bufferBarriers = m_StateTracker.getBufferBarriers();
+        if (textureBarriers.empty() && bufferBarriers.empty())
+            return;
+        if (m_ComputeEncoder && !m_RenderEncoder)
         {
-            endEncoding();
-            m_StateTracker.clearBarriers();
+            NSUInteger scope = 0;
+            if (!bufferBarriers.empty())
+                scope |= MTLBarrierScopeBuffers;
+            if (!textureBarriers.empty())
+                scope |= MTLBarrierScopeTextures;
+            [m_ComputeEncoder memoryBarrierWithScope:MTLBarrierScope(scope)];
         }
+        else
+            endEncoding();
+        m_StateTracker.clearBarriers();
     }
 
     void CommandList::setResourceStatesForBindingSet(IBindingSet* bindingSet)

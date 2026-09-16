@@ -363,11 +363,91 @@ namespace nvrhi::metal3
             return;
         }
         std::lock_guard<std::mutex> lock(table->mutex);
-        if (!keepContents)
-            table->entries.clear();
+        if (table->snapshot && table->snapshot->buffer)
+            table->removeResidency(table->snapshot->buffer);
+        const size_t keep = keepContents ? std::min<size_t>(newSize, table->entries.size()) : 0;
+        for (size_t index = keep; index < table->entries.size(); ++index)
+        {
+            if (table->entries[index].texture)
+                table->removeResidency(table->entries[index].texture);
+            if (table->entries[index].buffer)
+                table->removeResidency(table->entries[index].buffer);
+        }
+        table->entries.resize(keep);
         table->entries.resize(newSize);
         table->snapshot.reset();
         ++table->version;
+    }
+
+    DescriptorTable::~DescriptorTable()
+    {
+        if (residencySet && residencyQueue)
+            [residencyQueue removeResidencySet:residencySet];
+    }
+
+    bool DescriptorTable::ensureResidencySet(const MTL3Context& context)
+    {
+        if (residencySet)
+            return true;
+        MTLResidencySetDescriptor* desc = [[MTLResidencySetDescriptor alloc] init];
+        desc.initialCapacity = std::max<NSUInteger>(entries.size(), 1024);
+        desc.label = @"nvrhi descriptor table";
+        NSError* error = nil;
+        residencySet = [context.device newResidencySetWithDescriptor:desc error:&error];
+        if (!residencySet)
+        {
+            context.error(std::string("[nvrhi] Failed to create a Metal residency set: ") +
+                (error ? error.localizedDescription.UTF8String : "unknown error"));
+            return false;
+        }
+        residencyQueue = context.commonQueue;
+        [residencyQueue addResidencySet:residencySet];
+        for (const MetalBindingResource& entry : entries)
+        {
+            if (entry.texture)
+                addResidency(entry.texture);
+            if (entry.buffer)
+                addResidency(entry.buffer);
+        }
+        return true;
+    }
+
+    void DescriptorTable::addResidency(id<MTLResource> resource)
+    {
+        if (!residencySet || !resource)
+            return;
+        const uintptr_t key = reinterpret_cast<uintptr_t>((__bridge void*)resource);
+        if (residencyRefs[key]++ == 0)
+        {
+            [residencySet addAllocation:resource];
+            residencyDirty = true;
+        }
+    }
+
+    void DescriptorTable::removeResidency(id<MTLResource> resource)
+    {
+        if (!residencySet || !resource)
+            return;
+        const uintptr_t key = reinterpret_cast<uintptr_t>((__bridge void*)resource);
+        auto it = residencyRefs.find(key);
+        if (it == residencyRefs.end())
+            return;
+        if (--it->second == 0)
+        {
+            residencyRefs.erase(it);
+            [residencySet removeAllocation:resource];
+            residencyDirty = true;
+        }
+    }
+
+    void DescriptorTable::commitResidency()
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (residencySet && residencyDirty)
+        {
+            [residencySet commit];
+            residencyDirty = false;
+        }
     }
 
     bool Device::writeDescriptorTable(IDescriptorTable* descriptorTable, const BindingSetItem& item)
@@ -396,8 +476,23 @@ namespace nvrhi::metal3
         std::lock_guard<std::mutex> lock(table->mutex);
         if (item.slot >= table->entries.size())
             return false;
-        table->entries[item.slot] = std::move(entry);
-        table->snapshot.reset();
+        MetalBindingResource& slot = table->entries[item.slot];
+        if (slot.texture)
+            table->removeResidency(slot.texture);
+        if (slot.buffer)
+            table->removeResidency(slot.buffer);
+        slot = std::move(entry);
+        if (slot.texture)
+            table->addResidency(slot.texture);
+        if (slot.buffer)
+            table->addResidency(slot.buffer);
+        if (table->snapshot && table->snapshot->buffer)
+        {
+            auto* encodedEntries = static_cast<IRDescriptorTableEntry*>(table->snapshot->buffer.contents);
+            encodedEntries[item.slot] = encoded;
+        }
+        else
+            table->snapshot.reset();
         ++table->version;
         return true;
     }
@@ -415,22 +510,14 @@ namespace nvrhi::metal3
             context.error("[nvrhi] Failed to allocate Metal descriptor table.");
             return nullptr;
         }
-        result->entries.reserve(std::count_if(entries.begin(), entries.end(),
-            [](const MetalBindingResource& entry) { return entry.resource != nullptr; }));
         auto* encoded = static_cast<IRDescriptorTableEntry*>(result->buffer.contents);
         std::memset(encoded, 0, entries.size() * sizeof(IRDescriptorTableEntry));
         for (size_t index = 0; index < entries.size(); ++index)
             if (entries[index].resource)
-            {
                 encodeMetalBindingResource(encoded + index, entries[index]);
-                result->entries.push_back(entries[index]);
-                if (entries[index].buffer)
-                {
-                    auto* buffer = static_cast<Buffer*>(entries[index].resource.Get());
-                    if (buffer->desc.cpuAccess != CpuAccessMode::None)
-                        result->mappableBuffers.emplace_back(buffer);
-                }
-            }
+        if (!ensureResidencySet(context))
+            return nullptr;
+        addResidency(result->buffer);
         snapshot = result;
         return result;
     }

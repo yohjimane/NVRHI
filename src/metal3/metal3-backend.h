@@ -222,8 +222,6 @@ namespace nvrhi::metal3
     struct DescriptorTableSnapshot
     {
         id<MTLBuffer> buffer = nil;
-        std::vector<MetalBindingResource> entries;
-        std::vector<BufferHandle> mappableBuffers;
     };
 
     class UploadManager
@@ -507,11 +505,20 @@ namespace nvrhi::metal3
         std::vector<MetalBindingResource> entries;
         std::shared_ptr<DescriptorTableSnapshot> snapshot;
         uint64_t version = 1;
+        id<MTLResidencySet> residencySet = nil;
+        id<MTLCommandQueue> residencyQueue = nil;
+        std::unordered_map<uintptr_t, uint32_t> residencyRefs;
+        bool residencyDirty = false;
+        ~DescriptorTable() override;
         const BindingSetDesc* getDesc() const override { return nullptr; }
         IBindingLayout* getLayout() const override { return layout; }
         uint32_t getCapacity() const override;
         uint32_t getFirstDescriptorIndexInHeap() const override { return 0; }
         std::shared_ptr<DescriptorTableSnapshot> getSnapshot(const MTL3Context& context);
+        bool ensureResidencySet(const MTL3Context& context);
+        void addResidency(id<MTLResource> resource);
+        void removeResidency(id<MTLResource> resource);
+        void commitResidency();
     };
 
     struct TrackedCommandBuffer

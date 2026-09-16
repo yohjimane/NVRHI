@@ -3794,14 +3794,12 @@ namespace nvrhi::metal3
             if (!snapshot)
                 continue;
             referenceDescriptorSnapshot(snapshot);
+            table->commitResidency();
             const NSUInteger index = sampler ? kIRSamplerHeapBindPoint : kIRDescriptorHeapBindPoint;
             if (direct)
             {
                 bindGraphicsBuffer(encoder, snapshot->buffer, 0, index, stages);
             }
-            [encoder useResource:snapshot->buffer usage:MTLResourceUsageRead stages:stages];
-            for (const MetalBindingResource& resource : snapshot->entries)
-                useArgumentTableResource(encoder, resource, stages);
         }
         if ((plan.directlyIndexedResourceHeap && !bound[0]) || (plan.directlyIndexedSamplerHeap && !bound[1]))
         {
@@ -3844,11 +3842,9 @@ namespace nvrhi::metal3
             if (!snapshot)
                 continue;
             referenceDescriptorSnapshot(snapshot);
+            table->commitResidency();
             if (direct)
                 [encoder setBuffer:snapshot->buffer offset:0 atIndex:sampler ? kIRSamplerHeapBindPoint : kIRDescriptorHeapBindPoint];
-            [encoder useResource:snapshot->buffer usage:MTLResourceUsageRead];
-            for (const MetalBindingResource& resource : snapshot->entries)
-                useArgumentTableResource(encoder, resource);
         }
         if ((plan.directlyIndexedResourceHeap && !bound[0]) || (plan.directlyIndexedSamplerHeap && !bound[1]))
         {
@@ -4019,8 +4015,6 @@ namespace nvrhi::metal3
             m_ReferencedDescriptorSnapshots.end())
             return;
         m_ReferencedDescriptorSnapshots.push_back(snapshot);
-        for (const BufferHandle& buffer : snapshot->mappableBuffers)
-            referenceBuffer(buffer);
     }
 
     void CommandList::copyTexture(IStagingTexture* dest, const TextureSlice& destSlice, ITexture* src, const TextureSlice& srcSlice)
