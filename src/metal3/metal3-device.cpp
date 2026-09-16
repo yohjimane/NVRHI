@@ -68,9 +68,13 @@ namespace nvrhi::metal3
 
         // queues, resoureces reserve, allocation, etc...
         m_Context.commonQueue = desc.commonQueue;
+        m_Context.queues[uint32_t(CommandQueue::Compute)] = desc.computeQueue;
         for (uint32_t index = 0; index < uint32_t(CommandQueue::Count); ++index)
+        {
             m_DefaultLifetimeTrackers[index] = RefCountPtr<CommandListLifetimeTracker>::Create(
                 new CommandListLifetimeTracker(this, CommandQueue(index), true));
+            m_Queues[index].event = [m_Context.device newEvent];
+        }
     }
 
     Device::~Device()
@@ -98,27 +102,38 @@ namespace nvrhi::metal3
     Object Device::getNativeQueue(ObjectType objectType, CommandQueue queue)
     {
         if (objectType == ObjectTypes::MTL3_CommandQueue && uint32_t(queue) < uint32_t(CommandQueue::Count))
-            return Object((__bridge void*)m_Context.commonQueue);
+            return Object((__bridge void*)m_Context.queue(queue));
         return nullptr;
     }
 
     bool Device::waitForIdle()
     {
-        id<MTLCommandBuffer> commandBuffer;
+        id<MTLCommandBuffer> markers[uint32_t(CommandQueue::Count)] = {};
         {
             std::lock_guard<std::mutex> lock(m_Mutex);
-            commandBuffer = [m_Context.commonQueue commandBuffer];
-            if (!commandBuffer)
+            for (uint32_t index = 0; index < uint32_t(CommandQueue::Count); ++index)
             {
-                m_Context.error("[nvrhi] Failed to allocate a Metal idle marker.");
-                return false;
+                if (index != 0 && m_Context.queue(CommandQueue(index)) == m_Context.commonQueue)
+                    continue;
+                markers[index] = [m_Context.queue(CommandQueue(index)) commandBuffer];
+                if (!markers[index])
+                {
+                    m_Context.error("[nvrhi] Failed to allocate a Metal idle marker.");
+                    return false;
+                }
+                [markers[index] commit];
             }
-            [commandBuffer commit];
         }
-        [commandBuffer waitUntilCompleted];
+        bool success = true;
+        for (id<MTLCommandBuffer> marker : markers)
+        {
+            if (!marker)
+                continue;
+            [marker waitUntilCompleted];
+            success = success && marker.status == MTLCommandBufferStatusCompleted;
+        }
         std::lock_guard<std::mutex> lock(m_Mutex);
         updateCompletedSubmissions();
-        bool success = commandBuffer.status == MTLCommandBufferStatusCompleted;
         for (uint32_t index = 0; index < uint32_t(CommandQueue::Count); ++index)
         {
             success = success && m_Queues[index].firstFailure == 0;
@@ -483,7 +498,7 @@ namespace nvrhi::metal3
         EventQuery* event = getEventQuery(query);
         if (!event)
             return;
-        id<MTLCommandBuffer> commandBuffer = [m_Context.commonQueue commandBuffer];
+        id<MTLCommandBuffer> commandBuffer = [m_Context.queue(queue) commandBuffer];
         if (!commandBuffer)
         {
             m_Context.error("[nvrhi] Failed to allocate a Metal event marker.");
@@ -743,6 +758,19 @@ namespace nvrhi::metal3
 
         QueueState& queue = m_Queues[uint32_t(executionQueue)];
         const uint64_t instance = ++queue.submitted;
+        if (!queue.pendingWaits.empty())
+        {
+            id<MTLCommandBuffer> waits = [m_Context.queue(executionQueue) commandBufferWithUnretainedReferences];
+            if (!waits)
+            {
+                m_Context.error("[nvrhi] Failed to allocate a Metal queue wait command buffer.");
+                return 0;
+            }
+            for (const auto& wait : queue.pendingWaits)
+                [waits encodeWaitForEvent:wait.first value:wait.second];
+            [waits commit];
+            queue.pendingWaits.clear();
+        }
         for (size_t index = 0; index < numCommandLists; ++index)
         {
             auto* commandList = static_cast<CommandList*>(
@@ -750,6 +778,8 @@ namespace nvrhi::metal3
             queue.pending.push_back({commandList->trackedCmdBuffer, instance, index + 1 == numCommandLists});
             for (const BufferHandle& buffer : commandList->m_ReferencedMappableBuffers)
                 static_cast<Buffer*>(buffer.Get())->lastUseSubmissions[uint32_t(executionQueue)] = instance;
+            if (index + 1 == numCommandLists)
+                [commandList->trackedCmdBuffer encodeSignalEvent:queue.event value:instance];
             commandList->submit();
         }
         return instance;
@@ -767,9 +797,15 @@ namespace nvrhi::metal3
         updateCompletedSubmissions();
         const QueueState& producer = m_Queues[uint32_t(executionQueue)];
         if (instance > producer.submitted)
+        {
             m_Context.error("[nvrhi] Metal queue dependency references an unsubmitted execution identifier.");
-        else if (producer.firstFailure != 0 && producer.firstFailure <= instance)
+            return;
+        }
+        if (producer.firstFailure != 0 && producer.firstFailure <= instance)
             m_Context.error("[nvrhi] Metal queue dependency references failed GPU work.");
+        if (m_Context.queue(waitQueue) == m_Context.queue(executionQueue) || instance <= producer.completed)
+            return;
+        m_Queues[uint32_t(waitQueue)].pendingWaits.emplace_back(producer.event, instance);
     }
 
     CommandListLifetimeTrackerHandle Device::createCommandListLifetimeTracker(CommandQueue executionQueue)

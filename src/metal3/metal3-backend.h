@@ -167,6 +167,8 @@ namespace nvrhi::metal3
     {
         id<MTLDevice> device;
         id<MTLCommandQueue> commonQueue;
+        id<MTLCommandQueue> queues[uint32_t(CommandQueue::Count)] = {};
+        id<MTLCommandQueue> queue(CommandQueue index) const { return queues[uint32_t(index)] ? queues[uint32_t(index)] : commonQueue; }
 
         bool logBufferLifetime = false;
         uint32_t maxTextureDimension = 16384;
@@ -506,7 +508,7 @@ namespace nvrhi::metal3
         std::shared_ptr<DescriptorTableSnapshot> snapshot;
         uint64_t version = 1;
         id<MTLResidencySet> residencySet = nil;
-        id<MTLCommandQueue> residencyQueue = nil;
+        std::vector<id<MTLCommandQueue>> residencyQueues;
         std::unordered_map<uintptr_t, uint32_t> residencyRefs;
         bool residencyDirty = false;
         ~DescriptorTable() override;
@@ -999,6 +1001,8 @@ namespace nvrhi::metal3
             uint64_t completed = 0;
             uint64_t firstFailure = 0;
             std::deque<SubmittedCommandBuffer> pending;
+            id<MTLEvent> event = nil;
+            std::vector<std::pair<id<MTLEvent>, uint64_t>> pendingWaits;
         };
 
         void updateCompletedSubmissions();

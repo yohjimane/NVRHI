@@ -381,8 +381,8 @@ namespace nvrhi::metal3
 
     DescriptorTable::~DescriptorTable()
     {
-        if (residencySet && residencyQueue)
-            [residencyQueue removeResidencySet:residencySet];
+        for (id<MTLCommandQueue> queue : residencyQueues)
+            [queue removeResidencySet:residencySet];
     }
 
     bool DescriptorTable::ensureResidencySet(const MTL3Context& context)
@@ -400,8 +400,14 @@ namespace nvrhi::metal3
                 (error ? error.localizedDescription.UTF8String : "unknown error"));
             return false;
         }
-        residencyQueue = context.commonQueue;
-        [residencyQueue addResidencySet:residencySet];
+        for (uint32_t index = 0; index < uint32_t(CommandQueue::Count); ++index)
+        {
+            id<MTLCommandQueue> queue = context.queue(CommandQueue(index));
+            if (std::find(residencyQueues.begin(), residencyQueues.end(), queue) != residencyQueues.end())
+                continue;
+            [queue addResidencySet:residencySet];
+            residencyQueues.push_back(queue);
+        }
         for (const MetalBindingResource& entry : entries)
         {
             if (entry.texture)

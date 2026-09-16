@@ -70,8 +70,7 @@ namespace nvrhi::metal3
          * and not block the common queue
         */
         id<MTLCommandQueue> commonQueue = nil;
-        // id<MTLCommandQueue> computeQueue = nil;
-        // id<MTLCommandQueue> copyQueue = nil;
+        id<MTLCommandQueue> computeQueue = nil;
 
         uint32_t maxTimerQueries = 256;
         bool logBufferLifetime = false;

@@ -1807,10 +1807,10 @@ namespace nvrhi::metal3
             MTLCommandBufferDescriptor* descriptor = [MTLCommandBufferDescriptor new];
             descriptor.retainedReferences = YES;
             descriptor.errorOptions = MTLCommandBufferErrorOptionEncoderExecutionStatus;
-            trackedCmdBuffer = [m_Context.commonQueue commandBufferWithDescriptor:descriptor];
+            trackedCmdBuffer = [m_Context.queue(m_Desc.queueType) commandBufferWithDescriptor:descriptor];
         }
         else
-            trackedCmdBuffer = [m_Context.commonQueue commandBuffer];
+            trackedCmdBuffer = [m_Context.queue(m_Desc.queueType) commandBuffer];
         if (!trackedCmdBuffer)
         {
             m_Context.error("[nvrhi] Failed to allocate a Metal command buffer.");
