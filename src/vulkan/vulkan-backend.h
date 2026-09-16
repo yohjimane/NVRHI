@@ -174,6 +174,7 @@ namespace nvrhi::vulkan
         vk::PhysicalDeviceCooperativeVectorFeaturesNV coopVecFeatures;
         vk::PhysicalDeviceCooperativeVectorPropertiesNV coopVecProperties;
         vk::PhysicalDeviceRayTracingLinearSweptSpheresFeaturesNV linearSweptSpheresFeatures;
+        vk::PhysicalDeviceShaderAtomicInt64Features atomicInt64Features;
         vk::PhysicalDeviceSubgroupProperties subgroupProperties;
         IMessageCallback* messageCallback = nullptr;
         bool logBufferLifetime = false;

@@ -1373,6 +1373,7 @@ namespace nvrhi::d3d12
         D3D12_FEATURE_DATA_D3D12_OPTIONS5 m_Options5 = {};
         D3D12_FEATURE_DATA_D3D12_OPTIONS6 m_Options6 = {};
         D3D12_FEATURE_DATA_D3D12_OPTIONS7 m_Options7 = {};
+        bool m_BufferInt64AtomicsSupported = false;
         D3D12_FEATURE_DATA_D3D12_OPTIONS12 m_Options12 = {};
 
         RefCountPtr<RootSignature> getRootSignature(const static_vector<BindingLayoutHandle, c_MaxBindingLayouts>& pipelineLayouts, bool allowInputLayout);

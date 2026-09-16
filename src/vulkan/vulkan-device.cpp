@@ -227,6 +227,11 @@ namespace nvrhi::vulkan
             deviceFeatures2.setPNext(&m_Context.linearSweptSpheresFeatures);
             m_Context.physicalDevice.getFeatures2(&deviceFeatures2);
         }
+        {
+            vk::PhysicalDeviceFeatures2 deviceFeatures2;
+            deviceFeatures2.setPNext(&m_Context.atomicInt64Features);
+            m_Context.physicalDevice.getFeatures2(&deviceFeatures2);
+        }
 #ifdef NVRHI_WITH_RTXMU
         if (m_Context.extensions.KHR_acceleration_structure)
         {
@@ -403,6 +408,8 @@ namespace nvrhi::vulkan
             return (m_Queues[uint32_t(CommandQueue::Copy)] != nullptr);
         case Feature::ConstantBufferRanges:
             return true;
+        case Feature::BufferInt64Atomics:
+            return m_Context.atomicInt64Features.shaderBufferInt64Atomics;
         case Feature::WaveLaneCountMinMax:
             if (m_Context.subgroupProperties.subgroupSize == 0)
                 return false;

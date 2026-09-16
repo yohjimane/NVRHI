@@ -474,6 +474,12 @@ namespace nvrhi::d3d12
             m_HeapDirectlyIndexedEnabled = m_Options.ResourceBindingTier >= D3D12_RESOURCE_BINDING_TIER_3 && 
                 hasShaderModel && shaderModel.HighestShaderModel >= D3D_SHADER_MODEL_6_6;
         }
+        {
+            D3D12_FEATURE_DATA_SHADER_MODEL shaderModel = { D3D_SHADER_MODEL_6_6 };
+            m_BufferInt64AtomicsSupported = m_Options1.Int64ShaderOps != 0
+                && SUCCEEDED(m_Context.device->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &shaderModel, sizeof(shaderModel)))
+                && shaderModel.HighestShaderModel >= D3D_SHADER_MODEL_6_6;
+        }
     }
 
     Device::~Device()
@@ -823,6 +829,8 @@ namespace nvrhi::d3d12
             return m_SamplerFeedbackSupported;
         case Feature::HlslExtensionUAV:
             return m_HlslExtensionsSupported;
+        case Feature::BufferInt64Atomics:
+            return m_BufferInt64AtomicsSupported;
         case Feature::WaveLaneCountMinMax:
             if (m_Options1.WaveLaneCountMin == 0)
                 return false;

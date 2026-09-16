@@ -633,6 +633,10 @@ namespace nvrhi::metal3
         case Feature::DeferredCommandLists:
         case Feature::Meshlets:
             return true;
+        case Feature::BufferInt64Atomics:
+            return [m_Context.device supportsFamily:MTLGPUFamilyApple9]
+                || [m_Context.device supportsFamily:MTLGPUFamilyMac2]
+                || [m_Context.device supportsFamily:MTLGPUFamilyApple8];
         default:
             return false;
         }

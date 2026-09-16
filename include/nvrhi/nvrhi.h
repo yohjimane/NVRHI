@@ -3180,6 +3180,7 @@ namespace nvrhi
         CooperativeVectorInferencing,
         CooperativeVectorTraining,
         EnhancedBarriers, // DX12 only feature
+        BufferInt64Atomics,
     };
 
     enum class MessageSeverity : uint8_t
