@@ -1006,7 +1006,8 @@ namespace nvrhi::metal3
         return type == ResourceType::Texture_SRV ||
             type == ResourceType::TypedBuffer_SRV ||
             type == ResourceType::StructuredBuffer_SRV ||
-            type == ResourceType::RawBuffer_SRV;
+            type == ResourceType::RawBuffer_SRV ||
+            type == ResourceType::RayTracingAccelStruct;
     }
 
     static bool isUavType(ResourceType type)
@@ -1680,6 +1681,25 @@ namespace nvrhi::metal3
     }
 
     void CommandList::endEncoding(id<MTLBlitCommandEncoder> encoder)
+    {
+        if (!encoder)
+            return;
+        if (m_EncoderFence)
+        {
+            [encoder updateFence:m_EncoderFence];
+            m_EncoderFenceArmed = true;
+        }
+        [encoder endEncoding];
+    }
+
+    void CommandList::beginEncoding(id<MTLAccelerationStructureCommandEncoder> encoder, const char* operation)
+    {
+        annotateEncoder(encoder, operation);
+        if (m_EncoderFenceArmed)
+            [encoder waitForFence:m_EncoderFence];
+    }
+
+    void CommandList::endEncoding(id<MTLAccelerationStructureCommandEncoder> encoder)
     {
         if (!encoder)
             return;
@@ -4074,14 +4094,8 @@ namespace nvrhi::metal3
     void CommandList::setRayTracingState(const rt::State& state) { (void)state; unsupported(__func__); }
     void CommandList::dispatchRays(const rt::DispatchRaysArguments& args) { (void)args; unsupported(__func__); }
     void CommandList::buildOpacityMicromap(rt::IOpacityMicromap* omm, const rt::OpacityMicromapDesc& desc) { (void)omm; (void)desc; unsupported(__func__); }
-    void CommandList::copyRaytracingAccelerationStructure(rt::IAccelStruct* destination, rt::IAccelStruct* source) { (void)destination; (void)source; unsupported(__func__); }
-    void CommandList::buildBottomLevelAccelStruct(rt::IAccelStruct* as, const rt::GeometryDesc* pGeometries, size_t numGeometries, rt::AccelStructBuildFlags buildFlags) { (void)as; (void)pGeometries; (void)numGeometries; (void)buildFlags; unsupported(__func__); }
-    void CommandList::compactBottomLevelAccelStructs() { unsupported(__func__); }
-    void CommandList::buildTopLevelAccelStruct(rt::IAccelStruct* as, const rt::InstanceDesc* pInstances, size_t numInstances, rt::AccelStructBuildFlags buildFlags) { (void)as; (void)pInstances; (void)numInstances; (void)buildFlags; unsupported(__func__); }
-    void CommandList::buildTopLevelAccelStructFromBuffer(rt::IAccelStruct* as, nvrhi::IBuffer* instanceBuffer, uint64_t instanceBufferOffset, size_t numInstances, rt::AccelStructBuildFlags buildFlags) { (void)as; (void)instanceBuffer; (void)instanceBufferOffset; (void)numInstances; (void)buildFlags; unsupported(__func__); }
     void CommandList::executeMultiIndirectClusterOperation(const rt::cluster::OperationDesc& desc) { (void)desc; unsupported(__func__); }
     void CommandList::convertCoopVecMatrices(coopvec::ConvertMatrixLayoutDesc const* convertDescs, size_t numDescs) { (void)convertDescs; (void)numDescs; unsupported(__func__); }
-    void CommandList::setAccelStructState(rt::IAccelStruct* as, ResourceStates stateBits) { (void)as; (void)stateBits; unsupported(__func__); }
     void CommandList::clearSamplerFeedbackTexture(ISamplerFeedbackTexture* texture) { (void)texture; unsupported(__func__); }
     void CommandList::decodeSamplerFeedbackTexture(IBuffer* buffer, ISamplerFeedbackTexture* texture, Format format) { (void)buffer; (void)texture; (void)format; unsupported(__func__); }
     void CommandList::setSamplerFeedbackTextureState(ISamplerFeedbackTexture* texture, ResourceStates stateBits) { (void)texture; (void)stateBits; unsupported(__func__); }

@@ -4,6 +4,7 @@
 #include <sstream>
 #include <cstring>
 #include <metal_irconverter_runtime/metal_irconverter_runtime.h>
+#include <metal_irconverter_runtime/ir_raytracing.h>
 
 namespace nvrhi::metal3
 {
@@ -257,6 +258,12 @@ namespace nvrhi::metal3
             }
             break;
         }
+        case ResourceType::RayTracingAccelStruct:
+        {
+            auto* as = static_cast<AccelStruct*>(item.resourceHandle);
+            entry.accelerationStructure = as ? as->accelStruct : nil;
+            break;
+        }
         default:
             break;
         }
@@ -278,6 +285,14 @@ namespace nvrhi::metal3
             if (!resource.sampler)
                 return false;
             IRDescriptorTableSetSampler(entry, resource.sampler, resource.samplerMipBias);
+            return true;
+        }
+        if (resource.type == ResourceType::RayTracingAccelStruct)
+        {
+            auto* as = static_cast<AccelStruct*>(resource.resource.Get());
+            if (!as || !as->gpuHeaderBuffer)
+                return false;
+            IRDescriptorTableSetAccelerationStructure(entry, as->gpuHeaderBuffer.gpuAddress);
             return true;
         }
         if (!resource.buffer)
@@ -309,6 +324,7 @@ namespace nvrhi::metal3
         case ResourceType::RawBuffer_UAV:
         case ResourceType::ConstantBuffer:
         case ResourceType::Sampler:
+        case ResourceType::RayTracingAccelStruct:
             return true;
         default:
             return false;

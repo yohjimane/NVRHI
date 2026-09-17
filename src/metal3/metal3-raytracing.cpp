@@ -1,10 +1,418 @@
 #include "metal3-backend.h"
+#include <Metal/Metal.h>
+#define IR_PRIVATE_IMPLEMENTATION
+#include <metal_irconverter_runtime/metal_irconverter_runtime.h>
+#include <metal_irconverter_runtime/ir_raytracing.h>
+#include <algorithm>
+#include <cstring>
 
 namespace nvrhi::metal3
 {
+    static MTLAccelerationStructureUsage convertBuildFlags(rt::AccelStructBuildFlags flags)
+    {
+        MTLAccelerationStructureUsage usage = MTLAccelerationStructureUsageNone;
+        if ((flags & rt::AccelStructBuildFlags::AllowUpdate) != rt::AccelStructBuildFlags::None)
+            usage |= MTLAccelerationStructureUsageRefit;
+        return usage;
+    }
+
+    static MTLAttributeFormat convertAttributeFormat(Format format)
+    {
+        switch (format)
+        {
+        case Format::RGB32_FLOAT: return MTLAttributeFormatFloat3;
+        case Format::RG32_FLOAT: return MTLAttributeFormatFloat2;
+        case Format::RGBA32_FLOAT: return MTLAttributeFormatFloat4;
+        case Format::RGBA16_FLOAT: return MTLAttributeFormatHalf4;
+        case Format::RG16_FLOAT: return MTLAttributeFormatHalf2;
+        case Format::R32_FLOAT: return MTLAttributeFormatFloat;
+        default: return MTLAttributeFormatFloat3;
+        }
+    }
+
+    AccelStruct::~AccelStruct()
+    {
+        if (residency)
+        {
+            if (accelStruct) residency->remove(accelStruct);
+            if (gpuHeaderBuffer) residency->remove(gpuHeaderBuffer);
+            if (instanceContributionsBuffer) residency->remove(instanceContributionsBuffer);
+        }
+    }
+
+    Object AccelStruct::getNativeObject(ObjectType objectType)
+    {
+        if (objectType == ObjectTypes::MTL3_AccelerationStructure)
+            return Object((__bridge void*)accelStruct);
+        return nullptr;
+    }
+
+    rt::AccelStructHandle Device::createAccelStruct(const rt::AccelStructDesc& d)
+    {
+        if (![m_Context.device supportsRaytracing])
+        {
+            m_Context.error("[nvrhi] Metal device does not support ray tracing.");
+            return nullptr;
+        }
+
+        MTLAccelerationStructureDescriptor* descriptor = nil;
+        if (d.isTopLevel)
+        {
+            MTLInstanceAccelerationStructureDescriptor* tlas = [MTLInstanceAccelerationStructureDescriptor descriptor];
+            tlas.instanceCount = d.topLevelMaxInstances;
+            tlas.instanceDescriptorType = MTLAccelerationStructureInstanceDescriptorTypeDefault;
+            tlas.usage = convertBuildFlags(d.buildFlags);
+            descriptor = tlas;
+        }
+        else
+        {
+            MTLPrimitiveAccelerationStructureDescriptor* blas = [MTLPrimitiveAccelerationStructureDescriptor descriptor];
+            NSMutableArray* geometries = [NSMutableArray arrayWithCapacity:d.bottomLevelGeometries.size()];
+            for (const rt::GeometryDesc& geom : d.bottomLevelGeometries)
+            {
+                if (geom.geometryType != rt::GeometryType::Triangles)
+                    continue;
+                const rt::GeometryTriangles& tri = geom.geometryData.triangles;
+                MTLAccelerationStructureTriangleGeometryDescriptor* gd =
+                    [MTLAccelerationStructureTriangleGeometryDescriptor descriptor];
+                auto* vb = static_cast<Buffer*>(tri.vertexBuffer);
+                gd.vertexBuffer = vb ? vb->buffer : nil;
+                gd.vertexBufferOffset = tri.vertexOffset;
+                gd.vertexStride = tri.vertexStride;
+                gd.vertexFormat = convertAttributeFormat(tri.vertexFormat);
+                if (tri.indexBuffer)
+                {
+                    auto* ib = static_cast<Buffer*>(tri.indexBuffer);
+                    gd.indexBuffer = ib ? ib->buffer : nil;
+                    gd.indexBufferOffset = tri.indexOffset;
+                    gd.indexType = tri.indexFormat == Format::R16_UINT
+                        ? MTLIndexTypeUInt16 : MTLIndexTypeUInt32;
+                    gd.triangleCount = tri.indexCount / 3;
+                }
+                else
+                {
+                    gd.triangleCount = tri.vertexCount / 3;
+                }
+                gd.opaque = (geom.flags & rt::GeometryFlags::Opaque) != rt::GeometryFlags::None;
+                if (geom.useTransform)
+                {
+                    id<MTLBuffer> transformBuffer = [m_Context.device newBufferWithBytes:geom.transform
+                        length:sizeof(rt::AffineTransform)
+                        options:MTLResourceStorageModeShared | MTLResourceHazardTrackingModeUntracked];
+                    m_Context.residency->add(transformBuffer);
+                    gd.transformationMatrixBuffer = transformBuffer;
+                    gd.transformationMatrixBufferOffset = 0;
+                }
+                [geometries addObject:gd];
+            }
+            blas.geometryDescriptors = geometries;
+            blas.usage = convertBuildFlags(d.buildFlags);
+            descriptor = blas;
+        }
+
+        MTLAccelerationStructureSizes sizes = [m_Context.device accelerationStructureSizesWithDescriptor:descriptor];
+        id<MTLAccelerationStructure> native = [m_Context.device newAccelerationStructureWithSize:sizes.accelerationStructureSize];
+        if (!native)
+        {
+            m_Context.error("[nvrhi] Failed to create Metal acceleration structure.");
+            return nullptr;
+        }
+
+        if (!d.debugName.empty())
+            native.label = [NSString stringWithUTF8String:d.debugName.c_str()];
+
+        m_Context.residency->add(native);
+
+        AccelStruct* as = new AccelStruct();
+        as->desc = d;
+        as->accelStruct = native;
+        as->residency = m_Context.residency;
+        as->allowCompaction = (d.buildFlags & rt::AccelStructBuildFlags::AllowCompaction) != rt::AccelStructBuildFlags::None;
+        return rt::AccelStructHandle::Create(as);
+    }
+
+    MemoryRequirements Device::getAccelStructMemoryRequirements(rt::IAccelStruct* abstractAs)
+    {
+        (void)abstractAs;
+        return MemoryRequirements{};
+    }
+
+    bool Device::bindAccelStructMemory(rt::IAccelStruct* as, IHeap* heap, uint64_t offset)
+    {
+        (void)as;
+        (void)heap;
+        (void)offset;
+        return false;
+    }
+
+    rt::cluster::OperationSizeInfo Device::getClusterOperationSizeInfo(const rt::cluster::OperationParams& params)
+    {
+        (void)params;
+        return rt::cluster::OperationSizeInfo{};
+    }
+
+    static MTLAccelerationStructureDescriptor* buildDescriptorForBLAS(
+        const rt::GeometryDesc* pGeometries, size_t numGeometries,
+        rt::AccelStructBuildFlags buildFlags)
+    {
+        MTLPrimitiveAccelerationStructureDescriptor* blas = [MTLPrimitiveAccelerationStructureDescriptor descriptor];
+        NSMutableArray* geometries = [NSMutableArray arrayWithCapacity:numGeometries];
+        for (size_t i = 0; i < numGeometries; ++i)
+        {
+            const rt::GeometryDesc& geom = pGeometries[i];
+            if (geom.geometryType != rt::GeometryType::Triangles)
+                continue;
+            const rt::GeometryTriangles& tri = geom.geometryData.triangles;
+            MTLAccelerationStructureTriangleGeometryDescriptor* gd =
+                [MTLAccelerationStructureTriangleGeometryDescriptor descriptor];
+            auto* vb = static_cast<Buffer*>(tri.vertexBuffer);
+            gd.vertexBuffer = vb ? vb->buffer : nil;
+            gd.vertexBufferOffset = tri.vertexOffset;
+            gd.vertexStride = tri.vertexStride;
+            gd.vertexFormat = convertAttributeFormat(tri.vertexFormat);
+            if (tri.indexBuffer)
+            {
+                auto* ib = static_cast<Buffer*>(tri.indexBuffer);
+                gd.indexBuffer = ib ? ib->buffer : nil;
+                gd.indexBufferOffset = tri.indexOffset;
+                gd.indexType = tri.indexFormat == Format::R16_UINT
+                    ? MTLIndexTypeUInt16 : MTLIndexTypeUInt32;
+                gd.triangleCount = tri.indexCount / 3;
+            }
+            else
+            {
+                gd.triangleCount = tri.vertexCount / 3;
+            }
+            gd.opaque = (geom.flags & rt::GeometryFlags::Opaque) != rt::GeometryFlags::None;
+            [geometries addObject:gd];
+        }
+        blas.geometryDescriptors = geometries;
+        blas.usage = convertBuildFlags(buildFlags);
+        return blas;
+    }
+
+    void CommandList::buildBottomLevelAccelStruct(rt::IAccelStruct* abstractAs,
+        const rt::GeometryDesc* pGeometries, size_t numGeometries,
+        rt::AccelStructBuildFlags buildFlags)
+    {
+        auto* as = static_cast<AccelStruct*>(abstractAs);
+        if (!as || !as->accelStruct || !pGeometries || numGeometries == 0)
+            return;
+
+        endEncoding();
+        flushPendingClears();
+
+        MTLAccelerationStructureDescriptor* descriptor = buildDescriptorForBLAS(pGeometries, numGeometries, buildFlags);
+        MTLAccelerationStructureSizes sizes = [m_Context.device accelerationStructureSizesWithDescriptor:descriptor];
+        TransientBufferAllocation scratch = m_TransientIndirectResources.allocatePrivate(
+            NSUInteger(sizes.buildScratchBufferSize), 256);
+        if (!scratch.buffer)
+        {
+            m_RecordingFailed = true;
+            m_Context.error("[nvrhi] Failed to allocate Metal BLAS scratch buffer.");
+            return;
+        }
+
+        id<MTLAccelerationStructureCommandEncoder> encoder = [trackedCmdBuffer accelerationStructureCommandEncoder];
+        beginEncoding(encoder, "buildBLAS");
+        [encoder buildAccelerationStructure:as->accelStruct
+                                 descriptor:descriptor
+                              scratchBuffer:scratch.buffer
+                        scratchBufferOffset:scratch.offset];
+        if (as->allowCompaction)
+        {
+            TransientBufferAllocation compactedSizeBuffer = m_TransientIndirectResources.allocateShared(sizeof(uint32_t), 4);
+            if (compactedSizeBuffer.buffer)
+            {
+                [encoder writeCompactedAccelerationStructureSize:as->accelStruct
+                                                       toBuffer:compactedSizeBuffer.buffer
+                                                         offset:compactedSizeBuffer.offset];
+            }
+        }
+        endEncoding(encoder);
+        m_ReferencedNativeResources.push_back(as->accelStruct);
+    }
+
+    void CommandList::compactBottomLevelAccelStructs()
+    {
+    }
+
+    void CommandList::buildTopLevelAccelStruct(rt::IAccelStruct* abstractAs,
+        const rt::InstanceDesc* pInstances, size_t numInstances,
+        rt::AccelStructBuildFlags buildFlags)
+    {
+        auto* as = static_cast<AccelStruct*>(abstractAs);
+        if (!as || !as->accelStruct || !pInstances || numInstances == 0)
+            return;
+
+        endEncoding();
+        flushPendingClears();
+
+        NSMutableArray<id<MTLAccelerationStructure>>* blasArray = [NSMutableArray arrayWithCapacity:numInstances];
+        std::unordered_map<const void*, uint32_t> blasIndices;
+
+        for (size_t i = 0; i < numInstances; ++i)
+        {
+            auto* blas = static_cast<AccelStruct*>(pInstances[i].bottomLevelAS);
+            if (!blas || !blas->accelStruct)
+                continue;
+            const void* key = (__bridge const void*)blas->accelStruct;
+            if (blasIndices.find(key) == blasIndices.end())
+            {
+                blasIndices[key] = uint32_t([blasArray count]);
+                [blasArray addObject:blas->accelStruct];
+            }
+        }
+
+        size_t instanceBufferSize = numInstances * sizeof(MTLAccelerationStructureInstanceDescriptor);
+        TransientBufferAllocation instanceAlloc = m_TransientIndirectResources.allocateShared(
+            NSUInteger(instanceBufferSize), 64);
+        if (!instanceAlloc.buffer || !instanceAlloc.cpuAddress)
+        {
+            m_RecordingFailed = true;
+            m_Context.error("[nvrhi] Failed to allocate Metal TLAS instance buffer.");
+            return;
+        }
+
+        auto* mtlInstances = reinterpret_cast<MTLAccelerationStructureInstanceDescriptor*>(instanceAlloc.cpuAddress);
+        std::memset(mtlInstances, 0, instanceBufferSize);
+        for (size_t i = 0; i < numInstances; ++i)
+        {
+            const rt::InstanceDesc& src = pInstances[i];
+            MTLAccelerationStructureInstanceDescriptor& dst = mtlInstances[i];
+            for (int col = 0; col < 4; ++col)
+                for (int row = 0; row < 3; ++row)
+                    dst.transformationMatrix.columns[col][row] = src.transform[row * 4 + col];
+            dst.mask = src.instanceMask;
+            dst.options = MTLAccelerationStructureInstanceOptionNone;
+            if ((src.flags & rt::InstanceFlags::TriangleCullDisable) != rt::InstanceFlags::None)
+                dst.options |= MTLAccelerationStructureInstanceOptionDisableTriangleCulling;
+            if ((src.flags & rt::InstanceFlags::TriangleFrontCounterclockwise) != rt::InstanceFlags::None)
+                dst.options |= MTLAccelerationStructureInstanceOptionTriangleFrontFacingWindingCounterClockwise;
+            if ((src.flags & rt::InstanceFlags::ForceOpaque) != rt::InstanceFlags::None)
+                dst.options |= MTLAccelerationStructureInstanceOptionOpaque;
+            if ((src.flags & rt::InstanceFlags::ForceNonOpaque) != rt::InstanceFlags::None)
+                dst.options |= MTLAccelerationStructureInstanceOptionNonOpaque;
+            auto* blas = static_cast<AccelStruct*>(src.bottomLevelAS);
+            const void* key = blas ? (__bridge const void*)blas->accelStruct : nullptr;
+            auto it = key ? blasIndices.find(key) : blasIndices.end();
+            dst.accelerationStructureIndex = it != blasIndices.end() ? it->second : 0;
+            dst.intersectionFunctionTableOffset = 0;
+        }
+
+        MTLInstanceAccelerationStructureDescriptor* tlasDesc = [MTLInstanceAccelerationStructureDescriptor descriptor];
+        tlasDesc.instanceCount = numInstances;
+        tlasDesc.instanceDescriptorBuffer = instanceAlloc.buffer;
+        tlasDesc.instanceDescriptorBufferOffset = instanceAlloc.offset;
+        tlasDesc.instancedAccelerationStructures = blasArray;
+        tlasDesc.instanceDescriptorType = MTLAccelerationStructureInstanceDescriptorTypeDefault;
+        tlasDesc.usage = convertBuildFlags(buildFlags);
+
+        MTLAccelerationStructureSizes sizes = [m_Context.device accelerationStructureSizesWithDescriptor:tlasDesc];
+        if (sizes.accelerationStructureSize > as->accelStruct.size)
+        {
+            as->residency->remove(as->accelStruct);
+            as->accelStruct = [m_Context.device newAccelerationStructureWithSize:sizes.accelerationStructureSize];
+            if (!as->accelStruct)
+            {
+                m_RecordingFailed = true;
+                m_Context.error("[nvrhi] Failed to resize Metal TLAS.");
+                return;
+            }
+            as->residency->add(as->accelStruct);
+        }
+
+        TransientBufferAllocation scratch = m_TransientIndirectResources.allocatePrivate(
+            NSUInteger(sizes.buildScratchBufferSize), 256);
+        if (!scratch.buffer)
+        {
+            m_RecordingFailed = true;
+            m_Context.error("[nvrhi] Failed to allocate Metal TLAS scratch buffer.");
+            return;
+        }
+
+        id<MTLAccelerationStructureCommandEncoder> encoder = [trackedCmdBuffer accelerationStructureCommandEncoder];
+        beginEncoding(encoder, "buildTLAS");
+        [encoder buildAccelerationStructure:as->accelStruct
+                                 descriptor:tlasDesc
+                              scratchBuffer:scratch.buffer
+                        scratchBufferOffset:scratch.offset];
+        endEncoding(encoder);
+
+        uint32_t instanceCount32 = uint32_t(numInstances);
+        std::vector<uint32_t> instanceContributions(numInstances, 0);
+        for (size_t i = 0; i < numInstances; ++i)
+            instanceContributions[i] = pInstances[i].instanceContributionToHitGroupIndex;
+
+        NSUInteger icBufferSize = std::max<NSUInteger>(numInstances * sizeof(uint32_t), 4);
+        if (!as->instanceContributionsBuffer || as->instanceContributionsBuffer.length < icBufferSize)
+        {
+            if (as->instanceContributionsBuffer)
+                as->residency->remove(as->instanceContributionsBuffer);
+            as->instanceContributionsBuffer = [m_Context.device newBufferWithLength:icBufferSize
+                options:MTLResourceStorageModeShared | MTLResourceHazardTrackingModeUntracked];
+            as->residency->add(as->instanceContributionsBuffer);
+        }
+
+        NSUInteger headerSize = sizeof(IRRaytracingAccelerationStructureGPUHeader);
+        if (!as->gpuHeaderBuffer)
+        {
+            as->gpuHeaderBuffer = [m_Context.device newBufferWithLength:headerSize
+                options:MTLResourceStorageModeShared | MTLResourceHazardTrackingModeUntracked];
+            as->residency->add(as->gpuHeaderBuffer);
+        }
+
+        IRRaytracingSetAccelerationStructure(
+            static_cast<uint8_t*>(as->gpuHeaderBuffer.contents),
+            as->accelStruct.gpuResourceID,
+            static_cast<uint8_t*>(as->instanceContributionsBuffer.contents),
+            as->instanceContributionsBuffer.gpuAddress,
+            instanceContributions.data(),
+            instanceCount32);
+
+        m_ReferencedNativeResources.push_back(as->accelStruct);
+        m_ReferencedNativeBuffers.push_back(instanceAlloc.buffer);
+        m_ReferencedNativeBuffers.push_back(as->gpuHeaderBuffer);
+        m_ReferencedNativeBuffers.push_back(as->instanceContributionsBuffer);
+        for (id<MTLAccelerationStructure> blas in blasArray)
+            m_ReferencedNativeResources.push_back(blas);
+    }
+
+    void CommandList::buildTopLevelAccelStructFromBuffer(rt::IAccelStruct* as,
+        nvrhi::IBuffer* instanceBuffer, uint64_t instanceBufferOffset,
+        size_t numInstances, rt::AccelStructBuildFlags buildFlags)
+    {
+        (void)as;
+        (void)instanceBuffer;
+        (void)instanceBufferOffset;
+        (void)numInstances;
+        (void)buildFlags;
+        unsupported(__func__);
+    }
+
+    void CommandList::copyRaytracingAccelerationStructure(rt::IAccelStruct* destination, rt::IAccelStruct* source)
+    {
+        auto* dst = static_cast<AccelStruct*>(destination);
+        auto* src = static_cast<AccelStruct*>(source);
+        if (!dst || !src || !dst->accelStruct || !src->accelStruct)
+            return;
+        endEncoding();
+        flushPendingClears();
+        id<MTLAccelerationStructureCommandEncoder> encoder = [trackedCmdBuffer accelerationStructureCommandEncoder];
+        beginEncoding(encoder, "copyAccelStruct");
+        [encoder copyAccelerationStructure:src->accelStruct toAccelerationStructure:dst->accelStruct];
+        endEncoding(encoder);
+    }
+
+    void CommandList::setAccelStructState(rt::IAccelStruct* as, ResourceStates stateBits)
+    {
+        (void)as;
+        (void)stateBits;
+    }
 
     rt::PipelineHandle Device::createRayTracingPipeline(const rt::PipelineDesc& desc)
     {
+        (void)desc;
         m_Context.unsupported(__func__);
         return nullptr;
     }

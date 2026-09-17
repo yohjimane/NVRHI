@@ -362,6 +362,7 @@ namespace nvrhi::metal3
             case D3D_SIT_TBUFFER:
             case D3D_SIT_STRUCTURED:
             case D3D_SIT_BYTEADDRESS:
+            case D3D_SIT_RTACCELERATIONSTRUCTURE:
                 binding.type = MscArgumentType::SRV;
                 range.RangeType = IRDescriptorRangeTypeSRV;
                 break;

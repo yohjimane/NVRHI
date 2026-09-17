@@ -633,6 +633,9 @@ namespace nvrhi::metal3
         case Feature::DeferredCommandLists:
         case Feature::Meshlets:
             return true;
+        case Feature::RayTracingAccelStruct:
+        case Feature::RayQuery:
+            return [m_Context.device supportsRaytracing];
         case Feature::BufferInt64Atomics:
             return [m_Context.device supportsFamily:MTLGPUFamilyApple9]
                 || [m_Context.device supportsFamily:MTLGPUFamilyMac2]
@@ -720,33 +723,6 @@ namespace nvrhi::metal3
         return nullptr;
     }
 
-    rt::AccelStructHandle Device::createAccelStruct(const rt::AccelStructDesc& desc)
-    {
-        m_Context.unsupported(__func__);
-        return nullptr;
-    }
-
-    MemoryRequirements Device::getAccelStructMemoryRequirements(rt::IAccelStruct* as)
-    {
-        (void)as;
-        m_Context.unsupported(__func__);
-        return MemoryRequirements{};
-    }
-
-    rt::cluster::OperationSizeInfo Device::getClusterOperationSizeInfo(const rt::cluster::OperationParams& params)
-    {
-        (void)params;
-        m_Context.unsupported(__func__);
-        return rt::cluster::OperationSizeInfo{};
-    }
-
-    bool Device::bindAccelStructMemory(rt::IAccelStruct* as, IHeap* heap, uint64_t offset)
-    {
-        (void)as;
-        (void)heap;
-        (void)offset;
-        return false;
-    }
 
     nvrhi::CommandListHandle Device::createCommandList(const CommandListParameters& params)
     {

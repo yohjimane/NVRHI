@@ -23,6 +23,7 @@ namespace nvrhi
         constexpr ObjectType MTL3_ComputePipeline     = 0x00040007;
         constexpr ObjectType MTL3_Library             = 0x00040008;
         constexpr ObjectType MTL3_Function            = 0x00040009;
+        constexpr ObjectType MTL3_AccelerationStructure = 0x0004000A;
     };
 }
 

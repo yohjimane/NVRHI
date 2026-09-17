@@ -250,6 +250,7 @@ namespace nvrhi::metal3
         float samplerMipBias = 0.f;
         uint32_t textureViewOffsetInElements = 0;
 
+        id<MTLAccelerationStructure> accelerationStructure = nil;
         MTLResourceUsage usage = MTLResourceUsageRead;
     };
 
@@ -528,6 +529,22 @@ namespace nvrhi::metal3
         Object getNativeObject(ObjectType objectType) override;
     };
 
+    class AccelStruct : public RefCounter<rt::IAccelStruct>
+    {
+    public:
+        rt::AccelStructDesc desc;
+        id<MTLAccelerationStructure> accelStruct = nil;
+        id<MTLBuffer> gpuHeaderBuffer = nil;
+        id<MTLBuffer> instanceContributionsBuffer = nil;
+        std::shared_ptr<ResidencyRegistry> residency;
+        bool compacted = false;
+        bool allowCompaction = false;
+        ~AccelStruct() override;
+        const rt::AccelStructDesc& getDesc() const override { return desc; }
+        bool isCompacted() const override { return compacted; }
+        uint64_t getDeviceAddress() const override { return gpuHeaderBuffer ? gpuHeaderBuffer.gpuAddress : 0; }
+        Object getNativeObject(ObjectType objectType) override;
+    };
     class ComputePipeline : public RefCounter<IComputePipeline>
     {
     public:
@@ -873,6 +890,8 @@ namespace nvrhi::metal3
         std::unordered_map<Buffer*, VolatileBufferAllocation> m_VolatileBufferAllocations;
         uint64_t m_VolatileBufferWriteVersion = 0;
         std::vector<NSString*> m_DebugGroups;
+        void beginEncoding(id<MTLAccelerationStructureCommandEncoder> encoder, const char* operation);
+        void endEncoding(id<MTLAccelerationStructureCommandEncoder> encoder);
 
         TracyGpuScopeDesc m_TracyGpuScope;
 #if defined(NVRHI_METAL3_WITH_TRACY) && defined(TRACY_ENABLE)
