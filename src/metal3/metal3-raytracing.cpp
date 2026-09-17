@@ -60,7 +60,7 @@ namespace nvrhi::metal3
         {
             MTLInstanceAccelerationStructureDescriptor* tlas = [MTLInstanceAccelerationStructureDescriptor descriptor];
             tlas.instanceCount = d.topLevelMaxInstances;
-            tlas.instanceDescriptorType = MTLAccelerationStructureInstanceDescriptorTypeDefault;
+            tlas.instanceDescriptorType = MTLAccelerationStructureInstanceDescriptorTypeUserID;
             tlas.usage = convertBuildFlags(d.buildFlags);
             descriptor = tlas;
         }
@@ -264,7 +264,7 @@ namespace nvrhi::metal3
             }
         }
 
-        size_t instanceBufferSize = numInstances * sizeof(MTLAccelerationStructureInstanceDescriptor);
+        size_t instanceBufferSize = numInstances * sizeof(MTLAccelerationStructureUserIDInstanceDescriptor);
         TransientBufferAllocation instanceAlloc = m_TransientIndirectResources.allocateShared(
             NSUInteger(instanceBufferSize), 64);
         if (!instanceAlloc.buffer || !instanceAlloc.cpuAddress)
@@ -274,12 +274,12 @@ namespace nvrhi::metal3
             return;
         }
 
-        auto* mtlInstances = reinterpret_cast<MTLAccelerationStructureInstanceDescriptor*>(instanceAlloc.cpuAddress);
+        auto* mtlInstances = reinterpret_cast<MTLAccelerationStructureUserIDInstanceDescriptor*>(instanceAlloc.cpuAddress);
         std::memset(mtlInstances, 0, instanceBufferSize);
         for (size_t i = 0; i < numInstances; ++i)
         {
             const rt::InstanceDesc& src = pInstances[i];
-            MTLAccelerationStructureInstanceDescriptor& dst = mtlInstances[i];
+            MTLAccelerationStructureUserIDInstanceDescriptor& dst = mtlInstances[i];
             for (int col = 0; col < 4; ++col)
                 for (int row = 0; row < 3; ++row)
                     dst.transformationMatrix.columns[col][row] = src.transform[row * 4 + col];
@@ -298,6 +298,7 @@ namespace nvrhi::metal3
             auto it = key ? blasIndices.find(key) : blasIndices.end();
             dst.accelerationStructureIndex = it != blasIndices.end() ? it->second : 0;
             dst.intersectionFunctionTableOffset = 0;
+            dst.userID = src.instanceID;
         }
 
         MTLInstanceAccelerationStructureDescriptor* tlasDesc = [MTLInstanceAccelerationStructureDescriptor descriptor];
@@ -305,7 +306,7 @@ namespace nvrhi::metal3
         tlasDesc.instanceDescriptorBuffer = instanceAlloc.buffer;
         tlasDesc.instanceDescriptorBufferOffset = instanceAlloc.offset;
         tlasDesc.instancedAccelerationStructures = blasArray;
-        tlasDesc.instanceDescriptorType = MTLAccelerationStructureInstanceDescriptorTypeDefault;
+        tlasDesc.instanceDescriptorType = MTLAccelerationStructureInstanceDescriptorTypeUserID;
         tlasDesc.usage = convertBuildFlags(buildFlags);
 
         MTLAccelerationStructureSizes sizes = [m_Context.device accelerationStructureSizesWithDescriptor:tlasDesc];
